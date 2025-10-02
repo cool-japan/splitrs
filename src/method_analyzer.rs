@@ -116,11 +116,8 @@ impl ImplBlockAnalyzer {
 
     fn create_groups(&self, clusters: Vec<Vec<String>>, max_lines: usize) -> Vec<MethodGroup> {
         let mut groups = Vec::new();
-        let method_map: HashMap<String, &MethodInfo> = self
-            .methods
-            .iter()
-            .map(|m| (m.name.clone(), m))
-            .collect();
+        let method_map: HashMap<String, &MethodInfo> =
+            self.methods.iter().map(|m| (m.name.clone(), m)).collect();
 
         for cluster in clusters {
             let mut current_group = MethodGroup::new();
@@ -128,7 +125,9 @@ impl ImplBlockAnalyzer {
 
             for method_name in &cluster {
                 if let Some(method) = method_map.get(method_name) {
-                    if current_lines + method.line_count > max_lines && !current_group.methods.is_empty() {
+                    if current_lines + method.line_count > max_lines
+                        && !current_group.methods.is_empty()
+                    {
                         groups.push(current_group);
                         current_group = MethodGroup::new();
                         current_lines = 0;
@@ -169,6 +168,7 @@ impl MethodGroup {
         }
     }
 
+    #[allow(dead_code)]
     pub fn total_lines(&self) -> usize {
         self.methods.iter().map(|m| m.line_count).sum()
     }
@@ -183,7 +183,12 @@ impl MethodGroup {
 
         // Common patterns
         if first_method.starts_with("test_") || first_method.starts_with("check_") {
-            return first_method.split('_').next().unwrap_or("methods").to_string() + "_methods";
+            return first_method
+                .split('_')
+                .next()
+                .unwrap_or("methods")
+                .to_string()
+                + "_methods";
         }
 
         if first_method.starts_with("get_") || first_method.starts_with("set_") {

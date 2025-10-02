@@ -1,9 +1,9 @@
 [package]
 name = "splitrs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["OxiRS Contributors"]
-description = "A production-ready Rust refactoring tool that intelligently splits large files into maintainable modules"
+authors = ["OxiRS Team (Team KitaSan)"]
+description = "AST-based Rust refactoring tool with trait separation, config files, and intelligent module generation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cool-japan/splitrs"
 homepage = "https://github.com/cool-japan/splitrs"
@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["refactoring", "rust", "ast", "code-splitting", "module-organization"]
 categories = ["development-tools", "command-line-utilities", "parser-implementations"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 syn = { version = "2", features = ["full", "parsing", "printing", "visit"] }
 quote = "1"
@@ -19,6 +23,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
 prettyplease = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [[bin]]
 name = "splitrs"

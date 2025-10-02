@@ -10,6 +10,7 @@ SplitRS uses AST-based analysis to automatically refactor large Rust source file
 
 ## ✨ Features
 
+### Core Refactoring
 - 🎯 **AST-Based Refactoring**: Uses `syn` for accurate Rust parsing
 - 🧠 **Intelligent Method Clustering**: Groups related methods using call graph analysis
 - 📦 **Auto-Generated Imports**: Context-aware `use` statements with proper paths
@@ -17,6 +18,16 @@ SplitRS uses AST-based analysis to automatically refactor large Rust source file
 - 🚀 **Complex Type Support**: Handles generics, async, Arc/Mutex, nested types
 - ⚡ **Fast**: Processes 1600+ line files in <1 second
 - ✅ **Production-Tested**: Successfully refactored 10,000+ lines of real code
+
+### Advanced Features (v0.2.0+)
+- ⚙️ **Configuration Files**: `.splitrs.toml` support for project-specific settings
+- 🎭 **Trait Implementation Support**: Automatic separation of trait impls into dedicated modules
+- 🔗 **Type Alias Resolution**: Intelligent handling of type aliases in import generation
+- 🔍 **Circular Dependency Detection**: DFS-based cycle detection with Graphviz export
+- 👀 **Enhanced Preview Mode**: Beautiful formatted preview with statistics before refactoring
+- 💬 **Interactive Mode**: Confirmation prompts before file generation
+- 🔄 **Automatic Rollback Support**: Backup creation for safe refactoring
+- 📝 **Smart Documentation**: Auto-generated module docs with trait listings
 
 ## 📦 Installation
 
@@ -39,6 +50,12 @@ cargo build --release
 ```bash
 # Split a large file into modules
 splitrs --input src/large_file.rs --output src/large_file/
+
+# Preview what will be created (no files written)
+splitrs --input src/large_file.rs --output src/large_file/ --dry-run
+
+# Interactive mode with confirmation
+splitrs --input src/large_file.rs --output src/large_file/ --interactive
 ```
 
 ### Recommended Usage (with impl block splitting)
@@ -51,9 +68,91 @@ splitrs \
   --max-impl-lines 200
 ```
 
+### Using Configuration Files
+
+Create a `.splitrs.toml` in your project root:
+
+```toml
+[splitrs]
+max_lines = 1000
+max_impl_lines = 500
+split_impl_blocks = true
+
+[naming]
+type_module_suffix = "_type"
+impl_module_suffix = "_impl"
+
+[output]
+preserve_comments = true
+format_output = true
+```
+
+Then simply run:
+
+```bash
+splitrs --input src/large_file.rs --output src/large_file/
+```
+
 ## 📖 Examples
 
-### Example 1: Basic Refactoring
+### Example 1: Trait Implementations
+
+SplitRS automatically detects and separates trait implementations:
+
+**Input**: `user.rs`
+```rust
+pub struct User {
+    pub name: String,
+    pub age: u32,
+}
+
+impl User {
+    pub fn new(name: String, age: u32) -> Self { /* ... */ }
+}
+
+impl Debug for User { /* ... */ }
+impl Display for User { /* ... */ }
+impl Clone for User { /* ... */ }
+impl Default for User { /* ... */ }
+```
+
+**Command**:
+```bash
+splitrs --input user.rs --output user/ --dry-run
+```
+
+**Output**:
+```
+user/
+├── types.rs         # struct User definition + inherent impl
+├── user_traits.rs   # All trait implementations (Debug, Display, Clone, Default)
+└── mod.rs          # Module organization
+```
+
+**Generated `user_traits.rs`**:
+```rust
+//! # User - Trait Implementations
+//!
+//! This module contains trait implementations for `User`.
+//!
+//! ## Implemented Traits
+//!
+//! - `Debug`
+//! - `Display`
+//! - `Clone`
+//! - `Default`
+//!
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
+
+use super::types::User;
+
+impl Debug for User { /* ... */ }
+impl Display for User { /* ... */ }
+impl Clone for User { /* ... */ }
+impl Default for User { /* ... */ }
+```
+
+### Example 2: Basic Refactoring
 
 **Input**: `connection_pool.rs` (1660 lines)
 
@@ -89,7 +188,44 @@ connection_pool/
 └── ... (20 more focused modules)
 ```
 
-### Example 2: Complex Types
+### Example 3: Preview Mode
+
+Get detailed information before refactoring:
+
+```bash
+splitrs --input examples/trait_impl_example.rs --output /tmp/preview -n
+```
+
+**Output**:
+```
+============================================================
+DRY RUN - Preview Mode
+============================================================
+
+📊 Statistics:
+  Original file: 82 lines
+  Total modules to create: 4
+
+📁 Module Structure:
+  📄 product_traits.rs (2 trait impls)
+  📄 user_traits.rs (4 trait impls)
+  📄 types.rs (2 types)
+  📄 functions.rs (1 items)
+
+💾 Files that would be created:
+  📁 /tmp/preview/
+    📄 product_traits.rs
+    📄 user_traits.rs
+    📄 types.rs
+    📄 functions.rs
+    📄 mod.rs
+
+============================================================
+✓ Preview complete - no files were created
+============================================================
+```
+
+### Example 4: Complex Types
 
 SplitRS correctly handles complex Rust patterns:
 
@@ -133,14 +269,39 @@ where
 }
 ```
 
-## 🎛️ Options
+## 🎛️ Command-Line Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--input` | Input Rust source file (required) | - |
-| `--output` | Output directory for modules (required) | - |
-| `--split-impl-blocks` | Split large impl blocks into method groups | false |
-| `--max-impl-lines` | Maximum lines per impl group | 300 |
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--input <FILE>` | `-i` | Input Rust source file (required) | - |
+| `--output <DIR>` | `-o` | Output directory for modules (required) | - |
+| `--max-lines <N>` | `-m` | Maximum lines per module | 1000 |
+| `--split-impl-blocks` | | Split large impl blocks into method groups | false |
+| `--max-impl-lines <N>` | | Maximum lines per impl block before splitting | 500 |
+| `--dry-run` | `-n` | Preview without creating files | false |
+| `--interactive` | `-I` | Prompt for confirmation before creating files | false |
+| `--config <FILE>` | `-c` | Path to configuration file | `.splitrs.toml` |
+
+### Configuration File Options
+
+When using a `.splitrs.toml` file, you can configure:
+
+**`[splitrs]` section:**
+- `max_lines` - Maximum lines per module
+- `max_impl_lines` - Maximum lines per impl block
+- `split_impl_blocks` - Enable impl block splitting
+
+**`[naming]` section:**
+- `type_module_suffix` - Suffix for type modules (default: `"_type"`)
+- `impl_module_suffix` - Suffix for impl modules (default: `"_impl"`)
+- `use_snake_case` - Use snake_case for module names (default: `true`)
+
+**`[output]` section:**
+- `module_doc_template` - Template for module documentation
+- `preserve_comments` - Preserve original comments (default: `true`)
+- `format_output` - Format with prettyplease (default: `true`)
+
+Command-line arguments always override configuration file settings.
 
 ## 🏗️ How It Works
 
@@ -200,6 +361,47 @@ cargo test
 # Test on example files
 cargo run -- --input examples/large_struct.rs --output /tmp/test_output
 ```
+
+## 📚 Documentation
+
+### API Documentation (docs.rs)
+
+Full API documentation is available at [docs.rs/splitrs](https://docs.rs/splitrs).
+
+**Generate documentation locally:**
+
+```bash
+# Generate and open documentation
+cargo doc --no-deps --open
+
+# Generate documentation for all features
+cargo doc --all-features --no-deps
+```
+
+### Module Structure
+
+The codebase is organized into these main modules:
+
+- **`main.rs`** - CLI interface, file analysis, and module generation
+- **`config.rs`** - Configuration file parsing and management (`.splitrs.toml`)
+- **`method_analyzer.rs`** - Method dependency analysis and grouping
+- **`import_analyzer.rs`** - Type usage tracking and import generation
+- **`scope_analyzer.rs`** - Module scope analysis and visibility inference
+- **`dependency_analyzer.rs`** - Circular dependency detection and graph visualization
+
+### Key Types and Traits
+
+**Core Types:**
+- `FileAnalyzer` - Main analyzer for processing Rust files
+- `TypeInfo` - Information about a Rust type and its implementations
+- `Module` - Represents a generated module
+- `Config` - Configuration loaded from `.splitrs.toml`
+
+**Analysis Types:**
+- `ImplBlockAnalyzer` - Analyzes impl blocks for splitting
+- `MethodGroup` - Groups related methods together
+- `ImportAnalyzer` - Tracks type usage and generates imports
+- `DependencyGraph` - Detects circular dependencies
 
 ## 📚 Use Cases
 
@@ -264,21 +466,32 @@ cargo build
 cargo test
 ```
 
-### Roadmap to 90-100%
+### Implemented Features (v0.2.0)
 
-Current status: **80% production-ready**
+- ✅ Configuration file support (`.splitrs.toml`)
+- ✅ Trait implementation separation
+- ✅ Type alias resolution
+- ✅ Circular dependency detection (DFS + DOT export)
+- ✅ Enhanced preview mode with statistics
+- ✅ Interactive confirmation mode
+- ✅ Automatic rollback support
+- ✅ Smart documentation generation
 
-**Next features** (14-20 hours):
-- Type alias resolution
-- Dependency graph visualization
-- Circular dependency detection
-- Configuration file support
+### Roadmap to v1.0
 
-**Future enhancements** (20-30 hours):
-- Cross-crate analysis
-- Refactoring preview mode
-- Undo/rollback support
-- Plugin system
+**Current status:** 85% production-ready
+
+**Next features (v0.3.0):**
+- Incremental refactoring (detect existing splits)
+- Custom naming strategies (plugin system)
+- Integration test generation
+- Performance benchmarking suite
+
+**Future enhancements (v0.4.0+):**
+- Macro expansion support
+- Workspace-level refactoring
+- LSP integration
+- Editor plugins (VS Code, IntelliJ)
 
 ## 📄 License
 
@@ -295,11 +508,20 @@ at your option.
 - Formatted with [prettyplease](https://github.com/dtolnay/prettyplease)
 - Developed during the OxiRS refactoring project (32,398 lines refactored)
 
-## 📞 Support
+## 📞 Resources & Support
 
-- 📖 [Documentation](https://docs.rs/splitrs)
-- 🐛 [Issue Tracker](https://github.com/cool-japan/splitrs/issues)
-- 💬 [Discussions](https://github.com/cool-japan/splitrs/discussions)
+- 📖 **API Documentation**: [docs.rs/splitrs](https://docs.rs/splitrs)
+- 📦 **Crate**: [crates.io/crates/splitrs](https://crates.io/crates/splitrs)
+- 💻 **Source Code**: [github.com/cool-japan/splitrs](https://github.com/cool-japan/splitrs)
+- 🐛 **Issue Tracker**: [github.com/cool-japan/splitrs/issues](https://github.com/cool-japan/splitrs/issues)
+- 💬 **Discussions**: [github.com/cool-japan/splitrs/discussions](https://github.com/cool-japan/splitrs/discussions)
+
+### Getting Help
+
+1. **Check the docs**: Read the [API documentation](https://docs.rs/splitrs) and examples
+2. **Search issues**: Check if your question is already answered in [issues](https://github.com/cool-japan/splitrs/issues)
+3. **Ask questions**: Start a [discussion](https://github.com/cool-japan/splitrs/discussions)
+4. **Report bugs**: Open an [issue](https://github.com/cool-japan/splitrs/issues/new) with a reproducible example
 
 ---
 

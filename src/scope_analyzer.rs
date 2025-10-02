@@ -4,7 +4,7 @@
 //!
 //! Key Insight: In Rust, impl blocks must either:
 //! 1. Be in the same module as the type they implement
-//! 2. Use #[path] attributes to include them as submodules
+//! 2. Use `#[path]` attributes to include them as submodules
 //! 3. Live in a parent module that includes the type
 
 use std::collections::HashMap;
@@ -23,9 +23,11 @@ pub struct ScopeAnalyzer {
 #[derive(Debug, Clone)]
 pub struct TypeLocation {
     /// Name of the type
+    #[allow(dead_code)]
     pub type_name: String,
 
     /// Module where the type is defined
+    #[allow(dead_code)]
     pub module_path: String,
 
     /// Whether the type should have a dedicated module for its impls
@@ -39,6 +41,7 @@ pub struct ImplBlockInfo {
     pub type_name: String,
 
     /// The impl block itself
+    #[allow(dead_code)]
     pub impl_item: ItemImpl,
 
     /// Suggested module name for this impl group
@@ -54,7 +57,7 @@ pub enum ImplOrganizationStrategy {
     /// Keep all impl blocks in the type's module
     Inline,
 
-    /// Create a submodule for impl blocks with #[path] includes
+    /// Create a submodule for impl blocks with `#[path]` includes
     Submodule {
         /// Name of the parent module containing the type
         parent_module: String,
@@ -165,29 +168,32 @@ impl ScopeAnalyzer {
     }
 
     /// Generate the correct module structure code for a type with impl blocks
+    #[allow(dead_code)]
     pub fn generate_module_structure(&self, type_name: &str) -> ModuleStructure {
         let strategy = self.determine_strategy(type_name);
 
         match strategy {
-            ImplOrganizationStrategy::Inline => {
-                ModuleStructure {
-                    type_module: format!("{}_type", type_name.to_lowercase()),
-                    needs_path_attributes: false,
-                    path_includes: Vec::new(),
-                    re_exports: vec![format!("pub use {}::*;", format!("{}_type", type_name.to_lowercase()))],
-                }
-            }
+            ImplOrganizationStrategy::Inline => ModuleStructure {
+                type_module: format!("{}_type", type_name.to_lowercase()),
+                needs_path_attributes: false,
+                path_includes: Vec::new(),
+                re_exports: vec![format!(
+                    "pub use {}::*;",
+                    format!("{}_type", type_name.to_lowercase())
+                )],
+            },
 
-            ImplOrganizationStrategy::Wrapper { module_name } => {
-                ModuleStructure {
-                    type_module: module_name.clone(),
-                    needs_path_attributes: false,
-                    path_includes: Vec::new(),
-                    re_exports: vec![format!("pub use {}::*;", module_name)],
-                }
-            }
+            ImplOrganizationStrategy::Wrapper { module_name } => ModuleStructure {
+                type_module: module_name.clone(),
+                needs_path_attributes: false,
+                path_includes: Vec::new(),
+                re_exports: vec![format!("pub use {}::*;", module_name)],
+            },
 
-            ImplOrganizationStrategy::Submodule { parent_module, impl_modules } => {
+            ImplOrganizationStrategy::Submodule {
+                parent_module,
+                impl_modules,
+            } => {
                 let path_includes: Vec<String> = impl_modules
                     .iter()
                     .map(|m| format!("#[path = \"{}.rs\"]\nmod {};", m, m.replace('-', "_")))
@@ -204,6 +210,7 @@ impl ScopeAnalyzer {
     }
 
     /// Generate the type definition module content with proper impl includes
+    #[allow(dead_code)]
     pub fn generate_type_module_content(
         &self,
         type_name: &str,
@@ -266,17 +273,20 @@ impl ScopeAnalyzer {
 pub enum FieldVisibility {
     Private,
     PubSuper,
+    #[allow(dead_code)]
     PubCrate,
+    #[allow(dead_code)]
     Pub,
 }
 
 /// Generated module structure information
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ModuleStructure {
     /// Name of the module containing the type
     pub type_module: String,
 
-    /// Whether #[path] attributes are needed
+    /// Whether `#[path]` attributes are needed
     pub needs_path_attributes: bool,
 
     /// Path include statements to add

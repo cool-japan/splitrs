@@ -8,13 +8,18 @@ use syn::{
 /// Tracks type usage and generates appropriate use statements
 pub struct ImportAnalyzer {
     /// Types referenced in methods (type name -> potential paths)
+    #[allow(dead_code)]
     used_types: HashMap<String, HashSet<String>>,
 
     /// Known type mappings from original file
     type_mappings: HashMap<String, String>,
 
     /// Standard library types that don't need explicit imports
+    #[allow(dead_code)]
     std_types: HashSet<String>,
+
+    /// Type alias definitions (alias name -> underlying type)
+    type_aliases: HashMap<String, String>,
 }
 
 impl ImportAnalyzer {
@@ -39,6 +44,7 @@ impl ImportAnalyzer {
             used_types: HashMap::new(),
             type_mappings: HashMap::new(),
             std_types,
+            type_aliases: HashMap::new(),
         }
     }
 
@@ -50,18 +56,49 @@ impl ImportAnalyzer {
                     self.extract_use_mapping(use_item);
                 }
                 Item::Struct(s) => {
-                    self.type_mappings.insert(s.ident.to_string(), format!("super::types::{}", s.ident));
+                    self.type_mappings
+                        .insert(s.ident.to_string(), format!("super::types::{}", s.ident));
                 }
                 Item::Enum(e) => {
-                    self.type_mappings.insert(e.ident.to_string(), format!("super::types::{}", e.ident));
+                    self.type_mappings
+                        .insert(e.ident.to_string(), format!("super::types::{}", e.ident));
                 }
                 Item::Type(t) => {
-                    // Type alias
-                    self.type_mappings.insert(t.ident.to_string(), format!("super::types::{}", t.ident));
+                    // Type alias - store both mapping and underlying type
+                    let alias_name = t.ident.to_string();
+                    self.type_mappings
+                        .insert(alias_name.clone(), format!("super::types::{}", t.ident));
+
+                    // Extract underlying type for resolution
+                    let underlying_type = quote::quote!(#t).to_string();
+                    self.type_aliases.insert(alias_name, underlying_type);
                 }
                 _ => {}
             }
         }
+    }
+
+    /// Resolve a type alias to its underlying type
+    ///
+    /// # Arguments
+    ///
+    /// * `alias_name` - The name of the type alias
+    ///
+    /// # Returns
+    ///
+    /// The underlying type if this is an alias, otherwise the original name
+    #[allow(dead_code)]
+    pub fn resolve_type_alias(&self, alias_name: &str) -> String {
+        self.type_aliases
+            .get(alias_name)
+            .cloned()
+            .unwrap_or_else(|| alias_name.to_string())
+    }
+
+    /// Check if a name is a type alias
+    #[allow(dead_code)]
+    pub fn is_type_alias(&self, name: &str) -> bool {
+        self.type_aliases.contains_key(name)
     }
 
     fn extract_use_mapping(&mut self, use_item: &syn::ItemUse) {
@@ -73,12 +110,20 @@ impl ImportAnalyzer {
         if let Some(last_segment) = use_str.split("::").last() {
             let type_name = last_segment.trim_end_matches(';').trim();
             if !type_name.is_empty() && type_name.chars().next().unwrap().is_uppercase() {
-                self.type_mappings.insert(type_name.to_string(), use_str.replace("use ", "").trim_end_matches(';').trim().to_string());
+                self.type_mappings.insert(
+                    type_name.to_string(),
+                    use_str
+                        .replace("use ", "")
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string(),
+                );
             }
         }
     }
 
     /// Analyze methods to find used types
+    #[allow(dead_code)]
     pub fn analyze_methods(&mut self, methods: &[&ImplItemFn]) {
         for method in methods {
             let mut visitor = TypeVisitor::new();
@@ -87,13 +132,14 @@ impl ImportAnalyzer {
             for type_name in visitor.types_used {
                 self.used_types
                     .entry(type_name.clone())
-                    .or_insert_with(HashSet::new)
+                    .or_default()
                     .insert("unknown".to_string());
             }
         }
     }
 
     /// Generate use statements for a module
+    #[allow(dead_code)]
     pub fn generate_use_statements(&self, types_needed: &[String]) -> Vec<String> {
         let mut use_statements = HashSet::new();
         let mut std_collections = HashSet::new();
@@ -108,7 +154,12 @@ impl ImportAnalyzer {
 
             // Check if it's a std type
             if self.std_types.contains(type_name) {
-                if type_name == "HashMap" || type_name == "HashSet" || type_name == "VecDeque" || type_name == "BTreeMap" || type_name == "BTreeSet" {
+                if type_name == "HashMap"
+                    || type_name == "HashSet"
+                    || type_name == "VecDeque"
+                    || type_name == "BTreeMap"
+                    || type_name == "BTreeSet"
+                {
                     std_collections.insert(type_name.clone());
                 }
                 continue;
@@ -131,7 +182,10 @@ impl ImportAnalyzer {
         // Add std::collections if needed
         if !std_collections.is_empty() {
             let collections: Vec<_> = std_collections.into_iter().collect();
-            result.push(format!("use std::collections::{{{}}};", collections.join(", ")));
+            result.push(format!(
+                "use std::collections::{{{}}};",
+                collections.join(", ")
+            ));
         }
 
         // Add super imports
@@ -160,17 +214,34 @@ impl ImportAnalyzer {
     fn is_primitive(&self, type_name: &str) -> bool {
         matches!(
             type_name,
-            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-                | "u128" | "usize" | "f32" | "f64" | "bool" | "char" | "str" | "()"
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "bool"
+                | "char"
+                | "str"
+                | "()"
         )
     }
 
     /// Infer common imports for impl blocks
+    #[allow(dead_code)]
     pub fn infer_common_imports(&self) -> Vec<String> {
         self.infer_imports_with_depth(1)
     }
 
     /// Infer imports with specified module depth (number of super:: needed)
+    #[allow(dead_code)]
     pub fn infer_imports_with_depth(&self, depth: usize) -> Vec<String> {
         let super_prefix = "super::".repeat(depth);
         vec![
@@ -182,6 +253,7 @@ impl ImportAnalyzer {
 }
 
 /// Visitor to collect type references in methods
+#[allow(dead_code)]
 struct TypeVisitor {
     types_used: HashSet<String>,
 }

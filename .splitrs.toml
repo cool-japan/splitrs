@@ -1,0 +1,33 @@
+# SplitRS Configuration File
+# This file contains default settings for refactoring operations
+
+[splitrs]
+# Maximum lines per generated module
+max_lines = 1000
+
+# Maximum lines per impl block before splitting
+max_impl_lines = 500
+
+# Enable experimental impl block splitting
+split_impl_blocks = false
+
+[naming]
+# Suffix for type definition modules (e.g., "user" -> "user_type")
+type_module_suffix = "_type"
+
+# Suffix for impl block modules (e.g., "user" -> "user_impl")
+impl_module_suffix = "_impl"
+
+# Use snake_case for module names
+use_snake_case = true
+
+[output]
+# Template for module documentation
+# Available placeholders: {type_name}, {module_name}
+module_doc_template = "//! Auto-generated module\n"
+
+# Preserve original comments from source code
+preserve_comments = true
+
+# Format output using prettyplease
+format_output = true
