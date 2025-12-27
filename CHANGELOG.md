@@ -5,6 +5,55 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2025-12-27
+
+### Added
+- **Trait Bound Tracking**: New `TraitBoundAnalyzer` for detecting and preserving trait bounds
+  - Tracks trait bounds on types and generic parameters
+  - Detects trait implementations (impl Trait for Type)
+  - Generates proper trait imports for split modules
+  - Handles where clauses and complex trait bounds
+  - Ensures split modules preserve all required trait implementations
+- **Private Helper Dependency Tracking**: New `HelperDependencyTracker` for managing helper functions
+  - Detects private helper function dependencies
+  - Tracks transitive dependencies (helper calling helper)
+  - Groups helpers with their callers when splitting modules
+  - Prevents broken dependencies after refactoring
+  - Identifies shared helpers used by multiple methods
+- **Smart Glob Import Analysis**: New `GlobImportAnalyzer` for handling glob imports (use foo::*)
+  - Detects glob imports in source files
+  - Tracks which symbols are actually used from glob imports
+  - Suggests converting glob imports to specific imports
+  - Distinguishes between glob-imported and locally-defined symbols
+  - Generates smarter imports in split modules
+- **Library API**: Exposed public API for external usage and testing
+  - All analyzers now available as library modules
+  - Comprehensive integration tests for new features
+
+### Changed
+- **Test Suite**: Expanded significantly with new analyzers
+  - **Total Tests**: 183 (75 lib unit + 93 bin unit + 15 integration)
+  - Added 20 unit tests for new analyzer modules
+  - Added 6 integration tests for v0.2.4 features
+  - All tests pass with zero warnings (100% pass rate)
+- **Module Organization**: Added three new core analyzer modules
+  - `trait_bound_analyzer`: 380 lines, 6 unit tests
+  - `helper_dependency_tracker`: 333 lines, 7 unit tests
+  - `glob_import_analyzer`: 456 lines, 9 unit tests
+- **Codebase Size**: Grew from 5,965 to 8,880 lines (48.9% increase)
+  - Code: 7,211 lines (↑ 1,221 lines)
+  - Comments: 401 lines
+  - Total Files: 26 (↑ 4 files)
+
+### Fixed
+- **Critical**: Types with required trait implementations now preserve trait bounds correctly
+- **Critical**: Private helper functions are now tracked and moved with their callers
+- **Critical**: Glob imports (use foo::*) are now analyzed and handled intelligently
+
+### Performance
+- All existing performance characteristics maintained
+- New analyzers add minimal overhead to analysis phase
+
 ## [0.2.3] - 2025-12-27
 
 ### Added

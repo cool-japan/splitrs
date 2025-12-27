@@ -513,3 +513,224 @@ fn test_module_visibility_variants() {
         assert_eq!(fields.named.len(), 4);
     }
 }
+
+// ======================================================================
+// Integration tests for v0.2.4 new features
+// ======================================================================
+
+#[test]
+fn test_trait_bound_tracking() {
+    use splitrs::trait_bound_analyzer::TraitBoundAnalyzer;
+
+    let code = r#"
+        struct Container<T: Clone + Send> {
+            data: T,
+        }
+
+        impl<T: Clone + Send> Container<T> {
+            fn new(data: T) -> Self {
+                Self { data }
+            }
+        }
+
+        impl Clone for Container<i32> {
+            fn clone(&self) -> Self {
+                Self { data: self.data }
+            }
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut analyzer = TraitBoundAnalyzer::new();
+    analyzer.analyze_file(&file);
+
+    // Should detect trait bounds on Container
+    assert!(analyzer.requires_trait_bounds("Container"));
+
+    let traits = analyzer.get_required_traits("Container");
+    assert!(traits.contains(&"Clone".to_string()));
+    assert!(traits.contains(&"Send".to_string()));
+
+    // Should detect Clone implementation
+    let implemented = analyzer.get_implemented_traits("Container");
+    assert!(implemented.contains(&"Clone".to_string()));
+}
+
+#[test]
+fn test_helper_dependency_tracking() {
+    use splitrs::helper_dependency_tracker::HelperDependencyTracker;
+
+    let code = r#"
+        struct Processor;
+
+        impl Processor {
+            pub fn process(&self) -> i32 {
+                self.validate() + self.transform()
+            }
+
+            fn validate(&self) -> i32 {
+                self.check_invariants()
+            }
+
+            fn transform(&self) -> i32 {
+                42
+            }
+
+            fn check_invariants(&self) -> i32 {
+                0
+            }
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut tracker = HelperDependencyTracker::new();
+    tracker.analyze_file(&file);
+
+    // Should detect all helper dependencies
+    let helpers = tracker.get_required_helpers("process");
+    assert!(helpers.contains(&"validate".to_string()));
+    assert!(helpers.contains(&"transform".to_string()));
+
+    // Should detect transitive dependencies
+    assert!(helpers.contains(&"check_invariants".to_string()));
+
+    // Helper should be recognized as private
+    assert!(tracker.is_private_helper("validate"));
+    assert!(tracker.is_private_helper("transform"));
+    assert!(!tracker.is_private_helper("process"));
+}
+
+#[test]
+fn test_glob_import_analysis() {
+    use splitrs::glob_import_analyzer::GlobImportAnalyzer;
+
+    let code = r#"
+        use std::collections::*;
+        use std::fmt::Debug;
+
+        struct Container {
+            map: HashMap<String, i32>,
+            set: HashSet<i32>,
+        }
+
+        impl Debug for Container {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Ok(())
+            }
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut analyzer = GlobImportAnalyzer::new();
+    analyzer.analyze_file(&file);
+
+    // Should detect glob import
+    assert!(analyzer.has_glob_imports());
+
+    // HashMap and HashSet should be from glob
+    assert!(analyzer.is_from_glob_import("HashMap"));
+    assert!(analyzer.is_from_glob_import("HashSet"));
+
+    // Debug is specifically imported, not from glob
+    assert!(!analyzer.is_from_glob_import("Debug"));
+
+    // Should track specific imports
+    let specific = analyzer.get_used_specific_imports();
+    assert!(specific.contains(&"Debug".to_string()));
+}
+
+#[test]
+fn test_trait_bounds_with_where_clause() {
+    use splitrs::trait_bound_analyzer::TraitBoundAnalyzer;
+
+    let code = r#"
+        struct Cache<K, V>
+        where
+            K: std::hash::Hash + Eq,
+            V: Clone,
+        {
+            data: std::collections::HashMap<K, V>,
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut analyzer = TraitBoundAnalyzer::new();
+    analyzer.analyze_file(&file);
+
+    let traits = analyzer.get_required_traits("Cache");
+    assert!(traits.contains(&"Clone".to_string()));
+    assert!(traits.contains(&"Hash".to_string()));
+    assert!(traits.contains(&"Eq".to_string()));
+}
+
+#[test]
+fn test_helper_grouping_for_methods() {
+    use splitrs::helper_dependency_tracker::HelperDependencyTracker;
+
+    let code = r#"
+        struct Service;
+
+        impl Service {
+            pub fn operation_a(&self) -> i32 {
+                self.helper_a()
+            }
+
+            pub fn operation_b(&self) -> i32 {
+                self.helper_b()
+            }
+
+            fn helper_a(&self) -> i32 {
+                self.shared_helper()
+            }
+
+            fn helper_b(&self) -> i32 {
+                self.shared_helper()
+            }
+
+            fn shared_helper(&self) -> i32 {
+                42
+            }
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut tracker = HelperDependencyTracker::new();
+    tracker.analyze_file(&file);
+
+    // Get helpers for a group of methods
+    let methods = vec!["operation_a".to_string(), "operation_b".to_string()];
+    let helpers = tracker.get_helpers_for_method_group(&methods);
+
+    // Should include all helpers used by both methods
+    assert!(helpers.contains(&"helper_a".to_string()));
+    assert!(helpers.contains(&"helper_b".to_string()));
+    assert!(helpers.contains(&"shared_helper".to_string()));
+}
+
+#[test]
+fn test_glob_import_suggestions() {
+    use splitrs::glob_import_analyzer::GlobImportAnalyzer;
+
+    let code = r#"
+        use std::collections::*;
+
+        struct Data {
+            map: HashMap<String, i32>,
+            set: HashSet<String>,
+        }
+    "#;
+
+    let file = syn::parse_file(code).expect("Failed to parse");
+    let mut analyzer = GlobImportAnalyzer::new();
+    analyzer.analyze_file(&file);
+
+    let suggestions = analyzer.suggest_specific_imports();
+
+    // Should suggest HashMap and HashSet from std::collections
+    assert!(!suggestions.is_empty());
+    if let Some(symbols) = suggestions.get("std::collections") {
+        assert!(
+            symbols.contains(&"HashMap".to_string()) || symbols.contains(&"HashSet".to_string())
+        );
+    }
+}

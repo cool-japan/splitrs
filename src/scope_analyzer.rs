@@ -73,6 +73,12 @@ pub enum ImplOrganizationStrategy {
     },
 }
 
+impl Default for ScopeAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScopeAnalyzer {
     pub fn new() -> Self {
         Self {

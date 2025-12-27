@@ -503,6 +503,13 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ CI/CD templates (GitHub Actions, GitLab CI)
 - ✅ Test suite expanded to 73 tests (64 unit + 9 integration)
 
+### v0.2.4 (Released)
+- ✅ Trait bound tracking and preservation
+- ✅ Private helper dependency tracking
+- ✅ Smart glob import analysis
+- ✅ Library API for external usage
+- ✅ Test suite expanded to 99 tests (84 unit + 15 integration)
+
 ### v0.3.0 (Next Release)
 - Macro expansion support
 - LSP integration exploration

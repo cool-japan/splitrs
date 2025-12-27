@@ -58,17 +58,24 @@
 mod config;
 mod dependency_analyzer;
 mod error_recovery;
+mod field_access_tracker;
+mod glob_import_analyzer;
+mod helper_dependency_tracker;
 mod import_analyzer;
 mod incremental;
 mod method_analyzer;
 mod naming_strategy;
 mod scope_analyzer;
 mod test_generator;
+mod trait_bound_analyzer;
+mod trait_method_tracker;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::Config;
+use field_access_tracker::FieldAccessTracker;
+use helper_dependency_tracker::HelperDependencyTracker;
 use import_analyzer::ImportAnalyzer;
 use method_analyzer::{ImplBlockAnalyzer, MethodGroup};
 use quote::ToTokens;
@@ -77,6 +84,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::{File, Item, ItemImpl};
+use trait_method_tracker::TraitMethodTracker;
 
 /// Command-line arguments for the SplitRS refactoring tool
 ///
@@ -253,6 +261,7 @@ struct TraitImplInfo {
 /// - Determining which impl blocks are large enough to split
 /// - Tracking standalone items (functions, constants, etc.)
 /// - Coordinating with the scope analyzer for proper module placement
+/// - Tracking helper function dependencies for cross-module visibility
 struct FileAnalyzer {
     /// Map of type names to their information
     types: HashMap<String, TypeInfo>,
@@ -271,6 +280,15 @@ struct FileAnalyzer {
 
     /// Analyzer for determining proper module scope and placement
     scope_analyzer: ScopeAnalyzer,
+
+    /// Tracker for helper function dependencies
+    helper_tracker: HelperDependencyTracker,
+
+    /// Tracker for field access patterns
+    field_tracker: FieldAccessTracker,
+
+    /// Tracker for trait method calls
+    trait_tracker: TraitMethodTracker,
 }
 
 impl FileAnalyzer {
@@ -288,6 +306,9 @@ impl FileAnalyzer {
             split_impl_blocks,
             max_impl_lines,
             scope_analyzer: ScopeAnalyzer::new(),
+            helper_tracker: HelperDependencyTracker::new(),
+            field_tracker: FieldAccessTracker::new(),
+            trait_tracker: TraitMethodTracker::new(),
         }
     }
 
@@ -297,9 +318,19 @@ impl FileAnalyzer {
     /// 1. Analyzes all types to build scope information
     /// 2. Processes each item to extract types, impls, and determine splitting strategy
     fn analyze(&mut self, file: &File) {
+        // Analyze helper function dependencies for cross-module visibility
+        self.helper_tracker.analyze_file(file);
+
+        // Analyze field access patterns for cross-module visibility
+        self.field_tracker.analyze_file(file);
+
+        // Analyze trait definitions for trait method imports
+        self.trait_tracker.analyze_file(file);
+
         // First pass: analyze all types with scope analyzer
         self.scope_analyzer.analyze_types(&file.items);
 
+        // Process items
         for item in &file.items {
             match item {
                 Item::Struct(s) => {
@@ -400,9 +431,78 @@ impl FileAnalyzer {
                 Item::Fn(_) | Item::Const(_) | Item::Static(_) | Item::Macro(_) => {
                     self.standalone_items.push(item.clone());
                 }
+                Item::Mod(mod_item) => {
+                    // Skip test modules with #[path = "..."] attribute - they're handled separately
+                    let is_test_module = Self::is_test_module_with_path(mod_item);
+                    if !is_test_module {
+                        self.standalone_items.push(item.clone());
+                    }
+                }
                 _ => {
                     // Other items (type aliases, etc.) go to standalone
                     self.standalone_items.push(item.clone());
+                }
+            }
+        }
+    }
+
+    /// Analyze with referenced test files
+    ///
+    /// Detects `#[cfg(test)] #[path = "..."] mod tests;` patterns
+    /// and analyzes those files for field accesses to ensure proper visibility.
+    fn analyze_with_test_files(&mut self, file: &File, input_path: &Path) {
+        // First do the regular analysis
+        self.analyze(file);
+
+        // Then analyze referenced test files
+        for item in &file.items {
+            if let Item::Mod(mod_item) = item {
+                // Check for #[path = "..."] attribute
+                let mut path_attr: Option<String> = None;
+                let mut is_test = false;
+
+                for attr in &mod_item.attrs {
+                    let meta_path = attr.path();
+                    if let Some(ident) = meta_path.get_ident() {
+                        if ident == "cfg" {
+                            // Check if this is #[cfg(test)]
+                            if let syn::Meta::List(meta_list) = &attr.meta {
+                                let tokens = meta_list.tokens.to_string();
+                                if tokens.contains("test") {
+                                    is_test = true;
+                                }
+                            }
+                        } else if ident == "path" {
+                            // Extract the path value
+                            if let syn::Meta::NameValue(nv) = &attr.meta {
+                                if let syn::Expr::Lit(syn::ExprLit {
+                                    lit: syn::Lit::Str(lit_str),
+                                    ..
+                                }) = &nv.value
+                                {
+                                    path_attr = Some(lit_str.value());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If we found a test module with a path, analyze that file
+                if is_test {
+                    if let Some(test_path_str) = path_attr {
+                        // Resolve path relative to input file's directory
+                        if let Some(parent) = input_path.parent() {
+                            let test_file_path = parent.join(&test_path_str);
+                            if test_file_path.exists() {
+                                if let Ok(test_source) = fs::read_to_string(&test_file_path) {
+                                    if let Ok(test_file) = syn::parse_file(&test_source) {
+                                        // Analyze field accesses in the test file
+                                        self.field_tracker.analyze_test_file(&test_file);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -432,6 +532,32 @@ impl FileAnalyzer {
             .trait_
             .as_ref()
             .and_then(|(_, path, _)| path.segments.last().map(|s| s.ident.to_string()))
+    }
+
+    /// Check if a module item is a test module with a #[path = "..."] attribute
+    ///
+    /// These modules are handled specially and shouldn't be included in standalone items.
+    fn is_test_module_with_path(mod_item: &syn::ItemMod) -> bool {
+        let mut has_path = false;
+        let mut is_test = false;
+
+        for attr in &mod_item.attrs {
+            let meta_path = attr.path();
+            if let Some(ident) = meta_path.get_ident() {
+                if ident == "cfg" {
+                    if let syn::Meta::List(meta_list) = &attr.meta {
+                        let tokens = meta_list.tokens.to_string();
+                        if tokens.contains("test") {
+                            is_test = true;
+                        }
+                    }
+                } else if ident == "path" {
+                    has_path = true;
+                }
+            }
+        }
+
+        is_test && has_path
     }
 
     /// Get recommended visibility for a type's fields based on impl organization
@@ -557,14 +683,193 @@ impl FileAnalyzer {
             modules.push(current_module);
         }
 
-        // Add standalone items to a separate module
+        // Add standalone items to modules, splitting by line count
         if !self.standalone_items.is_empty() {
-            let mut standalone_module = Module::new("functions".to_string());
-            standalone_module.standalone_items = self.standalone_items.clone();
-            modules.push(standalone_module);
+            let mut current_fn_module = Module::new("functions".to_string());
+            let mut current_fn_lines = 0;
+            let mut fn_module_count = 0;
+
+            for item in &self.standalone_items {
+                // Estimate lines for this item
+                let item_lines = estimate_item_lines(item);
+
+                // If adding this item would exceed max_lines and we have items, start a new module
+                if current_fn_lines + item_lines > max_lines
+                    && !current_fn_module.standalone_items.is_empty()
+                {
+                    modules.push(current_fn_module);
+                    fn_module_count += 1;
+                    current_fn_module = Module::new(format!("functions_{}", fn_module_count + 1));
+                    current_fn_lines = 0;
+                }
+
+                current_fn_module.standalone_items.push(item.clone());
+                current_fn_lines += item_lines;
+            }
+
+            if !current_fn_module.standalone_items.is_empty() {
+                modules.push(current_fn_module);
+            }
         }
 
         modules
+    }
+
+    /// Compute which private functions need to be made pub(super) for cross-module access
+    ///
+    /// Returns:
+    /// - A set of function names that should have their visibility upgraded
+    /// - A map of (module_name -> HashMap<source_module, Vec<function_names>>) for imports
+    /// - A map of (struct_name -> Vec<field_name>) for fields that need visibility upgrade
+    #[allow(clippy::type_complexity)]
+    fn compute_cross_module_visibility(
+        &self,
+        modules: &[Module],
+    ) -> (
+        HashSet<String>,
+        HashMap<String, HashMap<String, Vec<String>>>,
+        HashMap<String, HashSet<String>>,
+    ) {
+        let mut needs_pub_super = HashSet::new();
+        // module_name -> (source_module -> function_names)
+        let mut cross_module_imports: HashMap<String, HashMap<String, Vec<String>>> =
+            HashMap::new();
+        // struct_name -> field_names that need pub(super)
+        let mut fields_need_pub_super: HashMap<String, HashSet<String>> = HashMap::new();
+
+        // Build a map of function name -> module name
+        let mut fn_to_module: HashMap<String, String> = HashMap::new();
+        for module in modules {
+            for item in &module.standalone_items {
+                if let Item::Fn(f) = item {
+                    fn_to_module.insert(f.sig.ident.to_string(), module.name.clone());
+                }
+            }
+        }
+
+        // Build a map of struct name -> module name
+        let mut struct_to_module: HashMap<String, String> = HashMap::new();
+        for module in modules {
+            for type_info in &module.types {
+                struct_to_module.insert(type_info.name.clone(), module.name.clone());
+            }
+        }
+
+        // For each module, check if any of its items call private functions in other modules
+        for module in modules {
+            // Collect all function names called by items in this module
+            let mut called_functions: HashSet<String> = HashSet::new();
+
+            for item in &module.standalone_items {
+                match item {
+                    Item::Fn(f) => {
+                        let fn_name = f.sig.ident.to_string();
+                        // Get helpers called by this function
+                        let helpers = self.helper_tracker.get_required_helpers(&fn_name);
+                        called_functions.extend(helpers);
+                    }
+                    Item::Impl(impl_item) => {
+                        // Also check impl blocks in standalone items (e.g., impl Trait for f32)
+                        for item in &impl_item.items {
+                            if let syn::ImplItem::Fn(method) = item {
+                                let method_name = method.sig.ident.to_string();
+                                let helpers =
+                                    self.helper_tracker.get_required_helpers(&method_name);
+                                called_functions.extend(helpers);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check trait impls from TraitImplInfo
+            for trait_impl in &module.trait_impls {
+                if let Item::Impl(impl_item) = &trait_impl.impl_item {
+                    for item in &impl_item.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            let method_name = method.sig.ident.to_string();
+                            let helpers = self.helper_tracker.get_required_helpers(&method_name);
+                            called_functions.extend(helpers);
+                        }
+                    }
+                }
+            }
+
+            // For each called function, check if it's in a different module
+            for called_fn in &called_functions {
+                if let Some(source_module) = fn_to_module.get(called_fn) {
+                    if source_module != &module.name {
+                        // This function is called from a different module
+                        // Check if it's a private function
+                        if self.helper_tracker.is_private_helper(called_fn) {
+                            needs_pub_super.insert(called_fn.clone());
+
+                            // Track the import needed for this module
+                            cross_module_imports
+                                .entry(module.name.clone())
+                                .or_default()
+                                .entry(source_module.clone())
+                                .or_default()
+                                .push(called_fn.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for cross-module field access
+        // Build accessor module map (function/method name -> module)
+        let mut accessor_to_module: HashMap<String, String> = HashMap::new();
+        for module in modules {
+            for item in &module.standalone_items {
+                if let Item::Fn(f) = item {
+                    accessor_to_module.insert(f.sig.ident.to_string(), module.name.clone());
+                }
+            }
+            // Also add methods from impl blocks
+            for type_info in &module.types {
+                for impl_item in &type_info.impls {
+                    if let Item::Impl(impl_block) = impl_item {
+                        for item in &impl_block.items {
+                            if let syn::ImplItem::Fn(method) = item {
+                                accessor_to_module
+                                    .insert(method.sig.ident.to_string(), module.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Add trait impl methods
+            for trait_impl in &module.trait_impls {
+                if let Item::Impl(impl_block) = &trait_impl.impl_item {
+                    for item in &impl_block.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            accessor_to_module
+                                .insert(method.sig.ident.to_string(), module.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check each struct's fields for cross-module access
+        for (struct_name, struct_module) in &struct_to_module {
+            let fields = self.field_tracker.get_fields_needing_upgrade(
+                struct_name,
+                struct_module,
+                &accessor_to_module,
+            );
+
+            if !fields.is_empty() {
+                fields_need_pub_super
+                    .entry(struct_name.clone())
+                    .or_default()
+                    .extend(fields);
+            }
+        }
+
+        (needs_pub_super, cross_module_imports, fields_need_pub_super)
     }
 }
 
@@ -606,7 +911,7 @@ struct Module {
 
     /// Attributes for the impl block
     ///
-    /// Preserves attributes like #[cfg], #[allow], etc. from the original impl block.
+    /// Preserves attributes like `#[cfg]`, `#[allow]`, etc. from the original impl block.
     impl_attrs: Vec<syn::Attribute>,
 
     /// Method group for split impl blocks
@@ -770,9 +1075,9 @@ impl Module {
             // use foo::*; -> always include (glob import)
             // use foo::{A, B}; -> check if any of A, B are used
 
-            if use_str.contains("::*") {
-                // Glob import - include if any symbol from this path might be used
-                // For now, be conservative and include it
+            // Check for glob imports - the token stream may have spaces (:: *)
+            if use_str.contains("::*") || use_str.contains(":: *") {
+                // Glob import - always include
                 return true;
             }
 
@@ -844,15 +1149,24 @@ impl Module {
     /// * `original_file` - The original parsed file, used for extracting imports
     /// * `original_use_statements` - Use statements from the original file to filter and include
     /// * `type_to_module` - Mapping of type names to module names for generating super:: imports
+    /// * `needs_pub_super` - Set of function names that need visibility upgraded to pub(super)
+    /// * `cross_module_imports` - Map of source_module -> function_names for this module's imports
+    /// * `fields_need_pub_super` - Map of struct_name -> field_names that need visibility upgrade
+    /// * `trait_tracker` - Optional tracker for generating trait imports when trait methods are called
     ///
     /// # Returns
     ///
     /// A formatted Rust source code string ready to be written to a file.
+    #[allow(clippy::too_many_arguments)]
     fn generate_content(
         &self,
         original_file: &File,
         original_use_statements: &[Item],
         type_to_module: &std::collections::HashMap<String, String>,
+        needs_pub_super: &HashSet<String>,
+        cross_module_imports: Option<&HashMap<String, Vec<String>>>,
+        fields_need_pub_super: &HashMap<String, HashSet<String>>,
+        trait_tracker: Option<&TraitMethodTracker>,
     ) -> String {
         let mut content = String::new();
 
@@ -955,10 +1269,16 @@ impl Module {
                 .push(type_name);
         }
 
-        let has_super_imports = !imports_by_module.is_empty();
+        // Track which symbols have been imported to avoid duplicates
+        let mut already_imported: HashSet<String> = HashSet::new();
+
+        let mut has_super_imports = !imports_by_module.is_empty();
         for (module_name, mut types) in imports_by_module {
             types.sort();
             types.dedup();
+            for t in &types {
+                already_imported.insert(t.clone());
+            }
             if types.len() == 1 {
                 content.push_str(&format!("use super::{}::{};\n", module_name, types[0]));
             } else {
@@ -967,6 +1287,41 @@ impl Module {
                     module_name,
                     types.join(", ")
                 ));
+            }
+        }
+
+        // Add cross-module function imports (for private functions upgraded to pub(super))
+        if let Some(fn_imports) = cross_module_imports {
+            for (source_module, mut functions) in fn_imports.clone() {
+                functions.sort();
+                functions.dedup();
+                has_super_imports = true;
+                if functions.len() == 1 {
+                    content.push_str(&format!(
+                        "use super::{}::{};\n",
+                        source_module, functions[0]
+                    ));
+                } else {
+                    content.push_str(&format!(
+                        "use super::{}::{{{}}};\n",
+                        source_module,
+                        functions.join(", ")
+                    ));
+                }
+            }
+        }
+
+        // Add trait imports for trait methods called on types (e.g., f32::simd_sin_f32_ultra needs SimdUnifiedOps)
+        if let Some(tracker) = trait_tracker {
+            let trait_imports =
+                tracker.get_required_trait_imports(&self.standalone_items, &self.name);
+            for (trait_name, trait_module) in trait_imports {
+                // Skip if already imported by the super:: imports section above
+                if trait_module != self.name && !already_imported.contains(&trait_name) {
+                    content.push_str(&format!("use super::{}::{};\n", trait_module, trait_name));
+                    already_imported.insert(trait_name);
+                    has_super_imports = true;
+                }
             }
         }
 
@@ -1113,17 +1468,30 @@ impl Module {
         let mut items = Vec::new();
 
         for type_info in &self.types {
-            // Apply field visibility based on self.field_visibility
-            let item = if let Some(ref vis) = self.field_visibility {
-                apply_field_visibility(type_info.item.clone(), vis)
-            } else {
-                type_info.item.clone()
-            };
+            // Apply field visibility based on cross-module field access analysis
+            let mut item = type_info.item.clone();
+
+            // First, check if this type has specific fields that need upgrade due to cross-module access
+            if let Some(fields_to_upgrade) = fields_need_pub_super.get(&type_info.name) {
+                if !fields_to_upgrade.is_empty() {
+                    item =
+                        apply_specific_field_visibility(item, &type_info.name, fields_to_upgrade);
+                }
+            }
+            // Fall back to general field visibility if set
+            else if let Some(ref vis) = self.field_visibility {
+                item = apply_field_visibility(item, vis);
+            }
+
             items.push(item);
             items.extend(type_info.impls.clone());
         }
 
-        items.extend(self.standalone_items.clone());
+        // Add standalone items, upgrading visibility for cross-module access
+        for item in &self.standalone_items {
+            let upgraded_item = upgrade_function_visibility(item.clone(), needs_pub_super);
+            items.push(upgraded_item);
+        }
 
         if !items.is_empty() {
             let formatted = prettyplease::unparse(&syn::File {
@@ -1152,6 +1520,19 @@ impl TypeInfo {
             .sum();
         item_lines + impl_lines
     }
+}
+
+/// Estimate the number of lines for a standalone item (function, const, etc.)
+///
+/// Uses prettyplease to format the item and count lines for accurate estimation.
+fn estimate_item_lines(item: &Item) -> usize {
+    // Use prettyplease for accurate line count (matches final output)
+    let formatted = prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: vec![item.clone()],
+    });
+    formatted.lines().count()
 }
 
 /// Extract type names from a syn::Type for import analysis
@@ -1293,21 +1674,96 @@ fn apply_field_visibility(item: Item, visibility: &scope_analyzer::FieldVisibili
     }
 }
 
+/// Upgrade function visibility to pub(super) if needed for cross-module access
+///
+/// When a private function is called from code that ends up in a different module,
+/// its visibility needs to be upgraded to `pub(super)` so it can be accessed.
+///
+/// # Arguments
+///
+/// * `item` - The item to potentially modify
+/// * `needs_pub_super` - Set of function names that need visibility upgrade
+///
+/// # Returns
+///
+/// The item with visibility upgraded if it's a function in the needs_pub_super set
+fn upgrade_function_visibility(item: Item, needs_pub_super: &HashSet<String>) -> Item {
+    match item {
+        Item::Fn(mut f) => {
+            let fn_name = f.sig.ident.to_string();
+            // Only upgrade if:
+            // 1. The function is in the needs_pub_super set
+            // 2. The function is currently private (Inherited visibility)
+            if needs_pub_super.contains(&fn_name) && matches!(f.vis, syn::Visibility::Inherited) {
+                f.vis = syn::parse_quote!(pub(super));
+            }
+            Item::Fn(f)
+        }
+        other => other,
+    }
+}
+
+/// Upgrade specific field visibility to pub(super) for cross-module access
+///
+/// When a struct field is accessed from code in a different module,
+/// that specific field's visibility needs to be upgraded to `pub(super)`.
+///
+/// # Arguments
+///
+/// * `item` - The item to modify (should be a struct)
+/// * `struct_name` - Name of the struct to modify
+/// * `fields_to_upgrade` - Set of field names that need visibility upgrade
+///
+/// # Returns
+///
+/// The modified item with specific fields upgraded to pub(super)
+fn apply_specific_field_visibility(
+    item: Item,
+    struct_name: &str,
+    fields_to_upgrade: &HashSet<String>,
+) -> Item {
+    match item {
+        Item::Struct(mut s) => {
+            if s.ident == struct_name {
+                for field in &mut s.fields {
+                    if let Some(ident) = &field.ident {
+                        let field_name = ident.to_string();
+                        // Only upgrade if field is in the set and currently private
+                        if fields_to_upgrade.contains(&field_name)
+                            && matches!(field.vis, syn::Visibility::Inherited)
+                        {
+                            field.vis = syn::parse_quote!(pub(super));
+                        }
+                    }
+                }
+            }
+            Item::Struct(s)
+        }
+        other => other,
+    }
+}
+
 /// Generates the `mod.rs` file content for the output directory
 ///
 /// Creates a module file that:
 /// - Declares all generated modules
 /// - Re-exports all public items from those modules
+/// - Preserves test module references if present
 ///
 /// # Arguments
 ///
 /// * `modules` - The list of modules to include
 /// * `_output_dir` - The output directory (currently unused but reserved for future use)
+/// * `test_module_path` - Optional path to a test module file (from #[path = "..."])
 ///
 /// # Returns
 ///
 /// The content of `mod.rs` as a string
-fn generate_mod_rs(modules: &[Module], _output_dir: &Path) -> Result<String> {
+fn generate_mod_rs(
+    modules: &[Module],
+    _output_dir: &Path,
+    test_module_path: Option<&str>,
+) -> Result<String> {
     let mut content = String::from("//! Auto-generated module structure\n\n");
 
     for module in modules {
@@ -1319,7 +1775,55 @@ fn generate_mod_rs(modules: &[Module], _output_dir: &Path) -> Result<String> {
         content.push_str(&format!("pub use {}::*;\n", module.name));
     }
 
+    // Preserve test module reference if present
+    if let Some(test_path) = test_module_path {
+        content.push_str("\n#[cfg(test)]\n");
+        content.push_str(&format!("#[path = \"{}\"]\n", test_path));
+        content.push_str("mod tests;\n");
+    }
+
     Ok(content)
+}
+
+/// Extract test module path from the original file
+///
+/// Detects `#[cfg(test)] #[path = "..."] mod tests;` patterns
+fn extract_test_module_path(file: &File) -> Option<String> {
+    for item in &file.items {
+        if let Item::Mod(mod_item) = item {
+            let mut path_attr: Option<String> = None;
+            let mut is_test = false;
+
+            for attr in &mod_item.attrs {
+                let meta_path = attr.path();
+                if let Some(ident) = meta_path.get_ident() {
+                    if ident == "cfg" {
+                        if let syn::Meta::List(meta_list) = &attr.meta {
+                            let tokens = meta_list.tokens.to_string();
+                            if tokens.contains("test") {
+                                is_test = true;
+                            }
+                        }
+                    } else if ident == "path" {
+                        if let syn::Meta::NameValue(nv) = &attr.meta {
+                            if let syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(lit_str),
+                                ..
+                            }) = &nv.value
+                            {
+                                path_attr = Some(lit_str.value());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_test && path_attr.is_some() {
+                return path_attr;
+            }
+        }
+    }
+    None
 }
 
 fn main() -> Result<()> {
@@ -1416,12 +1920,12 @@ fn main() -> Result<()> {
         );
     }
 
-    // Analyze the file
+    // Analyze the file (including any referenced test files)
     let mut analyzer = FileAnalyzer::new(
         config.splitrs.split_impl_blocks,
         config.splitrs.max_impl_lines,
     );
-    analyzer.analyze(&syntax_tree);
+    analyzer.analyze_with_test_files(&syntax_tree, &args.input);
 
     println!("Found {} types", analyzer.types.len());
     println!("Found {} standalone items", analyzer.standalone_items.len());
@@ -1558,6 +2062,35 @@ fn main() -> Result<()> {
         }
     }
 
+    // Register trait definitions with their modules for trait method import tracking
+    for module in &modules {
+        for item in &module.standalone_items {
+            if let Item::Trait(trait_item) = item {
+                let trait_name = trait_item.ident.to_string();
+                analyzer
+                    .trait_tracker
+                    .register_trait_module(&trait_name, &module.name);
+            }
+        }
+    }
+
+    // Compute which private functions and fields need pub(super) visibility for cross-module access
+    let (needs_pub_super, cross_module_imports, fields_need_pub_super) =
+        analyzer.compute_cross_module_visibility(&modules);
+    if !needs_pub_super.is_empty() {
+        println!(
+            "Upgrading {} private functions to pub(super) for cross-module access",
+            needs_pub_super.len()
+        );
+    }
+    if !fields_need_pub_super.is_empty() {
+        let total_fields: usize = fields_need_pub_super.values().map(|s| s.len()).sum();
+        println!(
+            "Upgrading {} struct fields to pub(super) for cross-module access",
+            total_fields
+        );
+    }
+
     // Track incremental stats
     let mut created_count = 0;
     let mut skipped_count = 0;
@@ -1574,8 +2107,15 @@ fn main() -> Result<()> {
         }
 
         let module_path = args.output.join(format!("{}.rs", module.name));
-        let content =
-            module.generate_content(&syntax_tree, &analyzer.use_statements, &type_to_module);
+        let content = module.generate_content(
+            &syntax_tree,
+            &analyzer.use_statements,
+            &type_to_module,
+            &needs_pub_super,
+            cross_module_imports.get(&module.name),
+            &fields_need_pub_super,
+            Some(&analyzer.trait_tracker),
+        );
         fs::write(&module_path, &content).context(format!(
             "Failed to write module file: {:?}\n\
              Please ensure:\n\
@@ -1601,8 +2141,9 @@ fn main() -> Result<()> {
         created_count += 1;
     }
 
-    // Write mod.rs
-    let mod_content = generate_mod_rs(&modules, &args.output)?;
+    // Write mod.rs (preserve test module reference if present)
+    let test_module_path = extract_test_module_path(&syntax_tree);
+    let mod_content = generate_mod_rs(&modules, &args.output, test_module_path.as_deref())?;
     let mod_path = args.output.join("mod.rs");
     fs::write(&mod_path, &mod_content).context(format!(
         "Failed to write mod.rs file: {:?}\n\
@@ -1835,9 +2376,9 @@ fn process_workspace_file(
     let source_code = fs::read_to_string(input)?;
     let syntax_tree = syn::parse_file(&source_code)?;
 
-    // Analyze the file
+    // Analyze the file (including any referenced test files)
     let mut analyzer = FileAnalyzer::new(true, max_lines / 2);
-    analyzer.analyze(&syntax_tree);
+    analyzer.analyze_with_test_files(&syntax_tree, input);
 
     // Group into modules
     let modules = analyzer.group_by_module(max_lines);
@@ -1850,17 +2391,41 @@ fn process_workspace_file(
         }
     }
 
+    // Register trait definitions with their modules for trait method import tracking
+    for module in &modules {
+        for item in &module.standalone_items {
+            if let Item::Trait(trait_item) = item {
+                let trait_name = trait_item.ident.to_string();
+                analyzer
+                    .trait_tracker
+                    .register_trait_module(&trait_name, &module.name);
+            }
+        }
+    }
+
+    // Compute cross-module visibility requirements
+    let (needs_pub_super, cross_module_imports, fields_need_pub_super) =
+        analyzer.compute_cross_module_visibility(&modules);
+
     // Write modules
     for module in &modules {
         let module_path = output.join(format!("{}.rs", module.name));
-        let content =
-            module.generate_content(&syntax_tree, &analyzer.use_statements, &type_to_module);
+        let content = module.generate_content(
+            &syntax_tree,
+            &analyzer.use_statements,
+            &type_to_module,
+            &needs_pub_super,
+            cross_module_imports.get(&module.name),
+            &fields_need_pub_super,
+            Some(&analyzer.trait_tracker),
+        );
         fs::write(&module_path, &content)?;
     }
 
-    // Write mod.rs
+    // Write mod.rs (preserve test module reference if present)
+    let test_module_path = extract_test_module_path(&syntax_tree);
     let mod_rs_path = output.join("mod.rs");
-    let mod_content = generate_mod_rs(&modules, &output)?;
+    let mod_content = generate_mod_rs(&modules, &output, test_module_path.as_deref())?;
     fs::write(&mod_rs_path, &mod_content)?;
 
     Ok(output)

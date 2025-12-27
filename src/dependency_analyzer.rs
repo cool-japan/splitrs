@@ -9,6 +9,12 @@ pub struct DependencyGraph {
     dependencies: HashMap<String, HashSet<String>>,
 }
 
+impl Default for DependencyGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DependencyGraph {
     #[allow(dead_code)]
     pub fn new() -> Self {

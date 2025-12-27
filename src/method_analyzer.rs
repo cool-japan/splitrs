@@ -17,6 +17,12 @@ pub struct ImplBlockAnalyzer {
     methods: Vec<MethodInfo>,
 }
 
+impl Default for ImplBlockAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImplBlockAnalyzer {
     pub fn new() -> Self {
         Self {

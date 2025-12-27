@@ -22,6 +22,12 @@ pub struct ImportAnalyzer {
     type_aliases: HashMap<String, String>,
 }
 
+impl Default for ImportAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImportAnalyzer {
     pub fn new() -> Self {
         let mut std_types = HashSet::new();

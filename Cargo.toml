@@ -1,6 +1,6 @@
 [package]
 name = "splitrs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "AST-based Rust refactoring tool with trait separation, config files, and intelligent module generation"
@@ -30,6 +30,10 @@ rayon = "1.10"
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+
+[lib]
+name = "splitrs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "splitrs"
