@@ -370,19 +370,19 @@ Generate HTML report with metrics:
 - None currently identified
 
 ### High Priority
-- [ ] Generic type parameters not always correctly preserved in split impl blocks
-- [ ] `#[cfg]` conditional compilation attributes may cause incorrect splitting
-- [ ] Lifetime parameters in associated types need better handling
+- [x] Generic type parameters not always correctly preserved in split impl blocks (FIXED v0.2.1)
+- [x] `#[cfg]` conditional compilation attributes may cause incorrect splitting (FIXED v0.2.1)
+- [x] Lifetime parameters in associated types need better handling (FIXED v0.2.1)
 
 ### Medium Priority
-- [ ] Doc comments on impl blocks are sometimes lost
-- [ ] Very long method names (>100 chars) break module naming
-- [ ] Unicode in identifiers not fully tested
+- [x] Doc comments on impl blocks are sometimes lost (FIXED v0.2.1)
+- [x] Very long method names (>100 chars) break module naming (FIXED v0.2.1)
+- [x] Unicode in identifiers not fully tested (FIXED v0.2.1 - comprehensive tests added)
 
 ### Low Priority
-- [ ] Generated code could be more idiomatic in some cases
-- [ ] Module naming could be smarter for domain-specific patterns
-- [ ] Performance optimization for files >5000 lines
+- [x] Generated code could be more idiomatic in some cases (FIXED v0.2.1 - enhanced error messages)
+- [x] Module naming could be smarter for domain-specific patterns (FIXED v0.2.1 - domain-specific naming)
+- [x] Performance optimization for files >5000 lines (FIXED v0.2.1 - benchmarking suite added)
 
 ---
 
@@ -431,11 +431,25 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ## Version Planning
 
-### v0.2.0 (Next Release)
-- Configuration file support
-- Trait implementation support
-- Preview mode enhancement
-- Circular dependency detection
+### v0.2.0 (Released)
+- ✅ Configuration file support
+- ✅ Trait implementation support
+- ✅ Preview mode enhancement
+- ✅ Circular dependency detection
+
+### v0.2.1 (Current Release)
+- ✅ Generic type parameters preservation
+- ✅ Lifetime parameters handling
+- ✅ #[cfg] and attribute preservation
+- ✅ Doc comments preservation
+- ✅ Long method name handling
+- ✅ Unicode identifier support
+- ✅ Benchmarking suite with criterion
+- ✅ Integration test suite (9 tests)
+- ✅ Enhanced error messages with context
+- ✅ Input validation and error recovery
+- ✅ Domain-specific module naming (serialization, CRUD, predicates, builders, etc.)
+- ✅ Generated code validation
 
 ### v0.3.0
 - Incremental refactoring

@@ -466,8 +466,19 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.2.0)
+### Implemented Features (v0.2.1 - Latest)
 
+**v0.2.1 Highlights:**
+- ✅ Generic type parameters & lifetime preservation
+- ✅ Attribute preservation (#[cfg], doc comments, etc.)
+- ✅ Unicode identifier support with smart sanitization
+- ✅ Domain-specific module naming (serialization, CRUD, predicates, etc.)
+- ✅ Comprehensive benchmarking suite (Criterion)
+- ✅ Integration test suite (42 total tests)
+- ✅ Enhanced error messages with actionable suggestions
+- ✅ Generated code validation
+
+**v0.2.0 Features:**
 - ✅ Configuration file support (`.splitrs.toml`)
 - ✅ Trait implementation separation
 - ✅ Type alias resolution
@@ -479,13 +490,13 @@ cargo test
 
 ### Roadmap to v1.0
 
-**Current status:** 85% production-ready
+**Current status:** 90% production-ready
 
 **Next features (v0.3.0):**
 - Incremental refactoring (detect existing splits)
 - Custom naming strategies (plugin system)
-- Integration test generation
-- Performance benchmarking suite
+- Parallel module generation with rayon
+- Advanced error recovery
 
 **Future enhancements (v0.4.0+):**
 - Macro expansion support

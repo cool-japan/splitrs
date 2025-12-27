@@ -178,6 +178,94 @@ impl MethodGroup {
             return "methods".to_string();
         }
 
+        // Analyze method names for common patterns
+        let method_names: Vec<&str> = self.methods.iter().map(|m| m.name.as_str()).collect();
+
+        // Domain-specific patterns (most specific first)
+        if method_names
+            .iter()
+            .any(|m| m.contains("serialize") || m.contains("deserialize"))
+        {
+            return "serialization".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("encode") || m.contains("decode"))
+        {
+            return "encoding".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("parse") || m.contains("parser"))
+        {
+            return "parsing".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("validate") || m.contains("validation"))
+        {
+            return "validation".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("render") || m.contains("draw"))
+        {
+            return "rendering".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("connect") || m.contains("disconnect") || m.contains("connection"))
+        {
+            return "connections".to_string();
+        }
+
+        if method_names.iter().any(|m| m.contains("cache")) {
+            return "caching".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("query") || m.contains("search") || m.contains("find"))
+        {
+            return "queries".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.contains("auth") || m.contains("login") || m.contains("logout"))
+        {
+            return "authentication".to_string();
+        }
+
+        if method_names
+            .iter()
+            .any(|m| m.starts_with("is_") || m.starts_with("has_") || m.starts_with("can_"))
+        {
+            return "predicates".to_string();
+        }
+
+        // Common CRUD patterns
+        let crud_count = method_names
+            .iter()
+            .filter(|m| {
+                m.starts_with("create")
+                    || m.starts_with("read")
+                    || m.starts_with("update")
+                    || m.starts_with("delete")
+                    || m.starts_with("insert")
+                    || m.starts_with("remove")
+            })
+            .count();
+
+        if crud_count >= 2 {
+            return "crud".to_string();
+        }
+
         // Try to find a common prefix or theme
         let first_method = &self.methods[0].name;
 
@@ -199,8 +287,51 @@ impl MethodGroup {
             return "handlers".to_string();
         }
 
-        // Fallback: use first method name
-        format!("{}_group", first_method)
+        if first_method.starts_with("on_") {
+            return "event_handlers".to_string();
+        }
+
+        if first_method.starts_with("with_") {
+            return "builders".to_string();
+        }
+
+        // Fallback: use first method name, but truncate if too long
+        // Max module name length should be reasonable for filesystems
+        let sanitized = Self::sanitize_module_name(first_method);
+        format!("{}_group", sanitized)
+    }
+
+    /// Sanitize a method name for use as a module name
+    ///
+    /// Truncates very long names and ensures the result is a valid module name.
+    /// Maximum length is 50 characters to ensure filesystem compatibility.
+    fn sanitize_module_name(name: &str) -> String {
+        const MAX_MODULE_NAME_LEN: usize = 50;
+
+        let name = if name.len() > MAX_MODULE_NAME_LEN {
+            // Truncate and add a hash to ensure uniqueness
+            let hash = {
+                let mut h = 0u32;
+                for byte in name.bytes() {
+                    h = h.wrapping_mul(31).wrapping_add(byte as u32);
+                }
+                h
+            };
+            format!("{}_{:x}", &name[..MAX_MODULE_NAME_LEN - 9], hash)
+        } else {
+            name.to_string()
+        };
+
+        // Ensure the name is a valid ASCII identifier (only ASCII alphanumeric and underscore)
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
     }
 }
 
@@ -289,5 +420,175 @@ mod tests {
 
         let groups = analyzer.group_methods(1000);
         assert!(!groups.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_very_long_method_name() {
+        let long_name = "this_is_a_very_long_method_name_that_exceeds_the_maximum_allowed_length_for_module_names_and_should_be_truncated_appropriately";
+        let sanitized = MethodGroup::sanitize_module_name(long_name);
+
+        // Should be truncated to MAX_MODULE_NAME_LEN
+        assert!(
+            sanitized.len() <= 50,
+            "Sanitized name is too long: {}",
+            sanitized.len()
+        );
+
+        // Should still be a valid identifier
+        assert!(sanitized.chars().all(|c| c.is_alphanumeric() || c == '_'));
+
+        // Should end with a hash for uniqueness
+        assert!(sanitized.contains('_'));
+    }
+
+    #[test]
+    fn test_sanitize_unicode_method_name() {
+        // Unicode identifiers should be sanitized to ASCII
+        let unicode_name = "メソッド名_with_unicode";
+        let sanitized = MethodGroup::sanitize_module_name(unicode_name);
+
+        // Should only contain ASCII alphanumeric and underscores
+        assert!(
+            sanitized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "Sanitized name contains non-ASCII: {}",
+            sanitized
+        );
+    }
+
+    #[test]
+    fn test_suggest_name_with_long_method() {
+        let mut group = MethodGroup::new();
+
+        // Create a method with a very long name
+        let long_method: ImplItemFn = parse_quote! {
+            fn this_is_an_extremely_long_method_name_that_would_normally_cause_problems_with_filesystem_limits_and_should_be_handled_gracefully(&self) {
+                println!("test");
+            }
+        };
+
+        group.methods.push(MethodInfo {
+            name: "this_is_an_extremely_long_method_name_that_would_normally_cause_problems_with_filesystem_limits_and_should_be_handled_gracefully".to_string(),
+            item: long_method,
+            calls_methods: HashSet::new(),
+            line_count: 30,
+        });
+
+        let suggested = group.suggest_name();
+
+        // Should include "_group" suffix
+        assert!(suggested.ends_with("_group"));
+
+        // Total length should be reasonable
+        assert!(
+            suggested.len() <= 60,
+            "Suggested name is too long: {}",
+            suggested.len()
+        );
+    }
+
+    #[test]
+    fn test_domain_specific_naming_serialization() {
+        let mut group = MethodGroup::new();
+
+        let method1: ImplItemFn = parse_quote! {
+            fn serialize(&self) -> Vec<u8> { vec![] }
+        };
+
+        let method2: ImplItemFn = parse_quote! {
+            fn deserialize(data: &[u8]) -> Self { unimplemented!() }
+        };
+
+        group.methods.push(MethodInfo {
+            name: "serialize".to_string(),
+            item: method1,
+            calls_methods: HashSet::new(),
+            line_count: 20,
+        });
+
+        group.methods.push(MethodInfo {
+            name: "deserialize".to_string(),
+            item: method2,
+            calls_methods: HashSet::new(),
+            line_count: 20,
+        });
+
+        assert_eq!(group.suggest_name(), "serialization");
+    }
+
+    #[test]
+    fn test_domain_specific_naming_crud() {
+        let mut group = MethodGroup::new();
+
+        for name in ["create", "read", "update"] {
+            let method: ImplItemFn = parse_quote! {
+                fn placeholder(&self) {}
+            };
+            group.methods.push(MethodInfo {
+                name: name.to_string(),
+                item: method,
+                calls_methods: HashSet::new(),
+                line_count: 10,
+            });
+        }
+
+        assert_eq!(group.suggest_name(), "crud");
+    }
+
+    #[test]
+    fn test_domain_specific_naming_predicates() {
+        let mut group = MethodGroup::new();
+
+        for name in ["is_valid", "has_data", "can_execute"] {
+            let method: ImplItemFn = parse_quote! {
+                fn placeholder(&self) -> bool { true }
+            };
+            group.methods.push(MethodInfo {
+                name: name.to_string(),
+                item: method,
+                calls_methods: HashSet::new(),
+                line_count: 10,
+            });
+        }
+
+        assert_eq!(group.suggest_name(), "predicates");
+    }
+
+    #[test]
+    fn test_domain_specific_naming_builders() {
+        let mut group = MethodGroup::new();
+
+        let method: ImplItemFn = parse_quote! {
+            fn with_name(self, name: String) -> Self { self }
+        };
+
+        group.methods.push(MethodInfo {
+            name: "with_name".to_string(),
+            item: method,
+            calls_methods: HashSet::new(),
+            line_count: 10,
+        });
+
+        assert_eq!(group.suggest_name(), "builders");
+    }
+
+    #[test]
+    fn test_domain_specific_naming_accessors() {
+        let mut group = MethodGroup::new();
+
+        for name in ["get_value", "set_value"] {
+            let method: ImplItemFn = parse_quote! {
+                fn placeholder(&self) {}
+            };
+            group.methods.push(MethodInfo {
+                name: name.to_string(),
+                item: method,
+                calls_methods: HashSet::new(),
+                line_count: 10,
+            });
+        }
+
+        assert_eq!(group.suggest_name(), "accessors");
     }
 }

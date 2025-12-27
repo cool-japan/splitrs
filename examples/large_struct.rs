@@ -105,3 +105,33 @@ impl DataStore {
         self.data.len()
     }
 }
+
+fn main() {
+    // This is an example file demonstrating a large struct with many methods
+    // To split this file, run:
+    // splitrs -i examples/large_struct.rs -o output/ --split-impl-blocks --max-impl-lines 300
+
+    let config = Config {
+        max_connections: 100,
+        timeout_ms: 5000,
+    };
+
+    println!(
+        "Config: max_connections={}, timeout_ms={}",
+        config.max_connections, config.timeout_ms
+    );
+
+    let mut store = DataStore::new(config);
+
+    let _ = store.insert("key1".to_string(), vec![1, 2, 3]);
+    println!("DataStore size: {}", store.size());
+    println!("Contains key1: {}", store.contains_key("key1"));
+
+    let conn = Connection {
+        id: 1,
+        active: true,
+    };
+    println!("Adding connection id={}, active={}", conn.id, conn.active);
+    store.add_connection(conn);
+    println!("Connection count: {}", store.connection_count());
+}

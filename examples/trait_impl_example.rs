@@ -84,3 +84,17 @@ impl Debug for Product {
             .finish()
     }
 }
+
+fn main() {
+    // This is an example file demonstrating trait implementations for SplitRS
+    // To split this file, run:
+    // splitrs -i examples/trait_impl_example.rs -o output/ --split-impl-blocks
+
+    let user = User::new("Alice".to_string(), 30);
+    println!("User: {}", user);
+    println!("Debug: {:?}", user);
+
+    let product = Product::new(1, "Laptop".to_string(), 999.99);
+    println!("Product: {}", product);
+    println!("Debug: {:?}", product);
+}
