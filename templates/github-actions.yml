@@ -1,0 +1,159 @@
+# SplitRS GitHub Actions Workflow
+# This workflow runs SplitRS as part of your CI pipeline to detect files
+# that exceed the configured line limit.
+#
+# Usage:
+# 1. Copy this file to your repository's .github/workflows/ directory
+# 2. Configure the threshold and other options as needed
+# 3. Commit and push to enable the workflow
+
+name: SplitRS File Size Check
+
+on:
+  push:
+    branches: [ main, master, develop ]
+    paths:
+      - '**.rs'
+  pull_request:
+    branches: [ main, master, develop ]
+    paths:
+      - '**.rs'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Maximum lines per file (adjust as needed for your project)
+  SPLITRS_TARGET_LINES: 500
+
+jobs:
+  file-size-check:
+    name: Check file sizes
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-action@stable
+      with:
+        components: rustfmt
+
+    - name: Cache SplitRS
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/splitrs
+        key: splitrs-${{ runner.os }}-v0.2.2
+
+    - name: Install SplitRS
+      run: |
+        if ! command -v splitrs &> /dev/null; then
+          cargo install splitrs
+        fi
+
+    - name: Run SplitRS analysis
+      run: |
+        # Analyze all Rust files and check for files exceeding the limit
+        splitrs --target $SPLITRS_TARGET_LINES --dry-run src/ 2>&1 | tee splitrs-report.txt
+        
+        # Check if any files exceeded the limit
+        if grep -q "Files identified for refactoring:" splitrs-report.txt; then
+          echo "::warning::Some files exceed the $SPLITRS_TARGET_LINES line limit"
+          # Exit with failure if you want to block PRs with large files
+          # exit 1
+        fi
+
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: splitrs-report
+        path: splitrs-report.txt
+
+  suggest-refactoring:
+    name: Suggest refactoring
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-action@stable
+
+    - name: Install SplitRS
+      run: cargo install splitrs
+
+    - name: Generate refactoring suggestions
+      id: suggestions
+      run: |
+        # Run analysis and capture output
+        output=$(splitrs --target $SPLITRS_TARGET_LINES --dry-run src/ 2>&1 || true)
+        
+        # Check if refactoring is suggested
+        if echo "$output" | grep -q "suggests splitting"; then
+          echo "has_suggestions=true" >> $GITHUB_OUTPUT
+          echo "$output" > suggestions.md
+        else
+          echo "has_suggestions=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Post PR comment
+      if: steps.suggestions.outputs.has_suggestions == 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const suggestions = fs.readFileSync('suggestions.md', 'utf8');
+          
+          const body = `## 📊 SplitRS Analysis Report
+          
+          The following files exceed the configured line limit and may benefit from refactoring:
+          
+          \`\`\`
+          ${suggestions}
+          \`\`\`
+          
+          ### 💡 Quick Fix
+          
+          Run the following command to automatically split large files:
+          
+          \`\`\`bash
+          cargo install splitrs
+          splitrs --target ${process.env.SPLITRS_TARGET_LINES} src/
+          \`\`\`
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
+
+  # Optional: Workspace analysis for monorepos
+  workspace-analysis:
+    name: Workspace analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-action@stable
+
+    - name: Install SplitRS
+      run: cargo install splitrs
+
+    - name: Analyze workspace
+      run: |
+        splitrs --workspace --target $SPLITRS_TARGET_LINES --dry-run . 2>&1 | tee workspace-report.txt
+
+    - name: Upload workspace report
+      uses: actions/upload-artifact@v4
+      with:
+        name: workspace-report
+        path: workspace-report.txt

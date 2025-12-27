@@ -1,0 +1,209 @@
+# SplitRS GitLab CI Configuration
+# This template integrates SplitRS into your GitLab CI/CD pipeline
+# to detect and report on files that exceed the configured line limit.
+#
+# Usage:
+# 1. Copy this file to your repository root as .gitlab-ci.yml
+#    (or include it in your existing .gitlab-ci.yml)
+# 2. Configure variables as needed
+# 3. Commit and push to enable the pipeline
+
+variables:
+  # Maximum lines per file (adjust as needed)
+  SPLITRS_TARGET_LINES: "500"
+  # Rust version to use
+  RUST_VERSION: "stable"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+# Cache Cargo dependencies and binaries
+.cargo-cache: &cargo-cache
+  cache:
+    key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/bin/
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+
+stages:
+  - lint
+  - analyze
+  - report
+
+# Install Rust and SplitRS
+.setup-rust: &setup-rust
+  image: rust:$RUST_VERSION
+  before_script:
+    - rustup component add rustfmt
+    - |
+      if [ ! -f "$CARGO_HOME/bin/splitrs" ]; then
+        cargo install splitrs
+      fi
+    - export PATH="$CARGO_HOME/bin:$PATH"
+
+# Basic file size check
+splitrs-check:
+  stage: analyze
+  <<: *setup-rust
+  <<: *cargo-cache
+  script:
+    - |
+      echo "🔍 Analyzing file sizes with target: $SPLITRS_TARGET_LINES lines"
+      splitrs --target $SPLITRS_TARGET_LINES --dry-run src/ 2>&1 | tee splitrs-report.txt
+      
+      # Count files exceeding limit
+      large_files=$(grep -c "lines)" splitrs-report.txt || echo "0")
+      
+      if [ "$large_files" -gt "0" ]; then
+        echo "⚠️  Found $large_files files exceeding the limit"
+        # Uncomment to fail the job if files are too large
+        # exit 1
+      else
+        echo "✅ All files are within the limit"
+      fi
+  artifacts:
+    paths:
+      - splitrs-report.txt
+    reports:
+      codequality: splitrs-codequality.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Detailed analysis for merge requests
+splitrs-mr-analysis:
+  stage: analyze
+  <<: *setup-rust
+  <<: *cargo-cache
+  script:
+    - |
+      echo "📊 Running detailed SplitRS analysis"
+      
+      # Get list of changed Rust files
+      changed_files=$(git diff --name-only $CI_MERGE_REQUEST_TARGET_BRANCH_SHA...HEAD -- '*.rs' | head -20)
+      
+      if [ -z "$changed_files" ]; then
+        echo "No Rust files changed in this MR"
+        exit 0
+      fi
+      
+      echo "Changed files:"
+      echo "$changed_files"
+      
+      # Analyze each changed file
+      for file in $changed_files; do
+        if [ -f "$file" ]; then
+          lines=$(wc -l < "$file")
+          if [ "$lines" -gt "$SPLITRS_TARGET_LINES" ]; then
+            echo "⚠️  $file: $lines lines (exceeds $SPLITRS_TARGET_LINES)"
+            splitrs --target $SPLITRS_TARGET_LINES --dry-run "$file" 2>&1 || true
+          else
+            echo "✅ $file: $lines lines"
+          fi
+        fi
+      done
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Generate code quality report
+splitrs-codequality:
+  stage: report
+  <<: *setup-rust
+  <<: *cargo-cache
+  script:
+    - |
+      echo "📈 Generating code quality report"
+      
+      # Create Code Quality report format
+      echo '[' > splitrs-codequality.json
+      first=true
+      
+      # Find large files and create issues
+      for file in $(find src -name "*.rs" 2>/dev/null); do
+        lines=$(wc -l < "$file")
+        if [ "$lines" -gt "$SPLITRS_TARGET_LINES" ]; then
+          if [ "$first" = true ]; then
+            first=false
+          else
+            echo ',' >> splitrs-codequality.json
+          fi
+          
+          # Generate fingerprint
+          fingerprint=$(echo -n "$file-too-large" | md5sum | cut -d' ' -f1)
+          
+          cat >> splitrs-codequality.json << EOF
+        {
+          "description": "File exceeds ${SPLITRS_TARGET_LINES} line limit (${lines} lines). Consider splitting with SplitRS.",
+          "check_name": "file-size",
+          "fingerprint": "$fingerprint",
+          "severity": "minor",
+          "location": {
+            "path": "$file",
+            "lines": {
+              "begin": 1
+            }
+          }
+        }
+      EOF
+        fi
+      done
+      
+      echo ']' >> splitrs-codequality.json
+      
+      cat splitrs-codequality.json
+  artifacts:
+    reports:
+      codequality: splitrs-codequality.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Workspace analysis job
+splitrs-workspace:
+  stage: analyze
+  <<: *setup-rust
+  <<: *cargo-cache
+  script:
+    - |
+      echo "📦 Analyzing Cargo workspace"
+      splitrs --workspace --target $SPLITRS_TARGET_LINES --dry-run . 2>&1 | tee workspace-report.txt
+  artifacts:
+    paths:
+      - workspace-report.txt
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  allow_failure: true
+
+# Scheduled weekly analysis
+splitrs-weekly:
+  stage: analyze
+  <<: *setup-rust
+  <<: *cargo-cache
+  script:
+    - |
+      echo "📅 Weekly SplitRS analysis report"
+      echo "================================="
+      
+      # Full workspace analysis
+      splitrs --workspace --target $SPLITRS_TARGET_LINES --dry-run . 2>&1 | tee weekly-report.txt
+      
+      # Summary statistics
+      total_files=$(find . -name "*.rs" -not -path "./target/*" | wc -l)
+      large_files=$(grep -c "lines)" weekly-report.txt || echo "0")
+      
+      echo ""
+      echo "📊 Summary"
+      echo "----------"
+      echo "Total Rust files: $total_files"
+      echo "Files exceeding limit: $large_files"
+      echo "Target line limit: $SPLITRS_TARGET_LINES"
+  artifacts:
+    paths:
+      - weekly-report.txt
+    expire_in: 4 weeks
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'

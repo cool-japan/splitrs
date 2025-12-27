@@ -5,6 +5,86 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2025-12-27
+
+### Added
+- **Workspace-Level Refactoring**: Process entire Cargo workspaces at once
+  - Analyze all crates in a workspace
+  - Identify files exceeding the line limit
+  - Parallel processing support for faster refactoring
+  - CLI flags: `--workspace`, `--target <LINES>`
+  - Workspace summary with crate statistics
+- **Parallel Module Generation**: Use multiple threads for faster processing
+  - Powered by rayon for efficient work-stealing parallelism
+  - Configurable thread count with `--threads <N>` (0 = auto)
+  - CLI flag: `--parallel`
+- **Enhanced Error Recovery**: Graceful handling of parse errors and failures
+  - Continue processing remaining files on error (`--continue-on-error`)
+  - Rollback support for failed operations (`--rollback`)
+  - Detailed error diagnostics with code snippets and suggestions
+  - Partial output generation on failure
+  - Error aggregation with severity levels
+- **CI/CD Integration Templates**: Ready-to-use CI/CD configurations
+  - GitHub Actions workflow (`templates/github-actions.yml`)
+    - Automated file size checks on PRs
+    - Refactoring suggestions posted as PR comments
+    - Code quality reports
+  - GitLab CI configuration (`templates/gitlab-ci.yml`)
+    - Pipeline integration for merge requests
+    - Code quality report generation
+    - Scheduled weekly analysis jobs
+- **New CLI Options**:
+  - `--workspace`: Enable workspace mode
+  - `--parallel`: Enable parallel processing
+  - `--threads <N>`: Number of threads (0 = auto)
+  - `--continue-on-error`: Continue on parse failures
+  - `--rollback`: Enable rollback on failure
+  - `--target <LINES>`: Target line limit for workspace mode
+
+### Changed
+- **Test Suite**: Expanded from 62 to 73 tests (64 unit + 9 integration)
+- **Dependencies**: Added `rayon = "1.10"` for parallel processing
+
+### Performance
+- Parallel processing provides significant speedup for large codebases
+- Workspace mode efficiently processes multiple crates concurrently
+
+## [0.2.2] - 2025-12-27
+
+### Added
+- **Custom Naming Strategies**: Pluggable naming system for generated modules
+  - `snake_case` (default): Standard Rust naming conventions
+  - `domain-specific`: Intelligent naming based on type patterns (Repository, Service, Controller, etc.)
+  - `kebab-case`: Alternative naming using dashes instead of underscores
+  - `NamingStrategy` trait for implementing custom naming conventions
+  - Configuration support via `[naming]` section in `.splitrs.toml`
+  - Custom type and pattern mappings for domain-specific naming
+- **Incremental Refactoring Mode**: Support for refactoring already-split codebases
+  - Detect existing module structure before refactoring
+  - Only process new or modified code
+  - Preserve manual customizations (marked with `// MANUAL:`, `// CUSTOM:`, etc.)
+  - Smart merge strategies: `smart`, `add-only`, `replace`, `skip-customized`
+  - CLI flag: `--incremental` with `--merge-strategy` option
+- **Integration Test Generation**: Auto-generate verification tests after refactoring
+  - Verify all types are exported correctly
+  - Verify method signatures are preserved
+  - Verify trait implementations are maintained
+  - CLI flag: `--generate-tests`
+  - Generates `refactoring_tests.rs` with compile-time checks
+- **New CLI Options**:
+  - `--naming-strategy <NAME>`: Choose module naming strategy
+  - `--incremental`: Enable incremental refactoring mode
+  - `--generate-tests`: Generate verification tests
+  - `--merge-strategy <STRATEGY>`: Merge strategy for incremental mode
+
+### Changed
+- **Test Suite**: Expanded from 42 to 62 tests (53 unit + 9 integration)
+- **Configuration**: Enhanced `[naming]` section with strategy selection and custom mappings
+- **Output**: Statistics now show incremental mode info and skipped modules
+
+### Performance
+- All existing performance characteristics maintained
+
 ## [0.2.1] - 2025-12-27
 
 ### Added

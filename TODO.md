@@ -170,8 +170,7 @@ Auto-generate meaningful documentation for split modules:
 ## Priority 3: Advanced Features
 
 ### 9. Incremental Refactoring
-**Estimated effort:** 10-12 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.2)
 
 Support refactoring files that have already been partially split:
 
@@ -180,11 +179,21 @@ Support refactoring files that have already been partially split:
 - Preserve manual customizations
 - Merge with existing modules intelligently
 
+**Usage:**
+```bash
+splitrs -i file.rs -o out/ --incremental --merge-strategy smart
+```
+
+**Merge Strategies:**
+- `smart` (default): Preserve manual edits, update auto-generated
+- `add-only`: Only add new types/impls, never update existing
+- `replace`: Replace all content
+- `skip-customized`: Skip modules with manual edits
+
 ---
 
 ### 10. Custom Naming Strategies
-**Estimated effort:** 5-6 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.2)
 
 Allow users to customize module naming:
 
@@ -192,12 +201,19 @@ Allow users to customize module naming:
 // Plugin-based naming strategy
 trait NamingStrategy {
     fn module_name(&self, type_name: &str, purpose: ModulePurpose) -> String;
-    fn suggest_group_name(&self, methods: &[MethodInfo]) -> String;
+    fn suggest_group_name(&self, type_name: &str, methods: &MethodNamingInfo) -> String;
 }
 ```
 
 **Built-in strategies:**
-- `snake_case` (default)
+- `snake_case` (default): Standard Rust naming (user_type, user_impl)
+- `domain-specific`: Smart naming for patterns (UserRepository → user_repository_repo)
+- `kebab-case`: Hyphenated module names
+
+**Usage:**
+```bash
+splitrs -i file.rs -o out/ --naming-strategy domain-specific
+```
 - `kebab-case`
 - Domain-specific (e.g., `user_repository`, `user_service`)
 
@@ -222,8 +238,7 @@ Improve handling of declarative and procedural macros:
 ---
 
 ### 12. Workspace-Level Refactoring
-**Estimated effort:** 8-10 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.3)
 
 Support refactoring across entire Cargo workspaces:
 
@@ -236,26 +251,38 @@ splitrs --workspace --target 1000  # Split all files >1000 lines
 - Update cross-crate imports
 - Maintain workspace consistency
 - Parallel processing
+- Process multiple crates
+- Update cross-crate imports
+- Maintain workspace consistency
+- Parallel processing
 
 ---
 
 ### 13. Integration Test Generation
-**Estimated effort:** 6-8 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.2)
 
 Generate integration tests to verify refactoring correctness:
 
 ```rust
-// tests/refactoring_verify.rs
+// refactoring_tests.rs (auto-generated)
 #[test]
 fn verify_all_types_exported() {
-    // Ensure all original types are still accessible
+    // Compile-time checks that all types are accessible
+    let _: Option<User> = None;
+    let _: Option<Product> = None;
 }
 
 #[test]
-fn verify_method_signatures() {
-    // Ensure all methods have same signatures
+fn verify_trait_implementations() {
+    // Verify traits are still implemented
+    fn _assert_debug<T: std::fmt::Debug>() {}
+    _assert_debug::<User>();
 }
+```
+
+**Usage:**
+```bash
+splitrs -i file.rs -o out/ --generate-tests
 ```
 
 ---
@@ -276,8 +303,7 @@ Provide Language Server Protocol integration:
 ## Priority 4: Code Quality & Performance
 
 ### 15. Benchmarking Suite
-**Estimated effort:** 4-5 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.1)
 
 Add comprehensive benchmarks using `criterion`:
 
@@ -299,8 +325,7 @@ criterion_group!(benches,
 ---
 
 ### 16. Parallel Module Generation
-**Estimated effort:** 5-6 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.3)
 
 Use `rayon` for parallel processing:
 
@@ -310,11 +335,16 @@ Use `rayon` for parallel processing:
 
 **Expected improvement:** 3-5x faster on multi-core systems
 
+**Usage:**
+```bash
+splitrs --parallel --threads 4  # Use 4 threads
+splitrs --parallel              # Use all available cores
+```
+
 ---
 
 ### 17. Error Recovery
-**Estimated effort:** 6-8 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.3)
 
 Improve error handling and recovery:
 
@@ -322,21 +352,28 @@ Improve error handling and recovery:
 - Provide detailed error messages with code snippets
 - Suggest fixes for common issues
 - Partial output generation when possible
+- Rollback support for failed operations
+
+**Usage:**
+```bash
+splitrs --continue-on-error  # Continue processing on failures
+splitrs --rollback           # Enable rollback on failure
+```
 
 ---
 
 ## Priority 5: Ecosystem Integration
 
 ### 18. CI/CD Templates
-**Estimated effort:** 2-3 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.2.3)
 
 Provide ready-to-use CI/CD configurations:
 
-- GitHub Actions workflow
-- GitLab CI template
-- Pre-commit hooks
-- Automated refactoring PRs
+- GitHub Actions workflow (`templates/github-actions.yml`)
+- GitLab CI template (`templates/gitlab-ci.yml`)
+- Automated file size checks
+- Refactoring suggestions on PRs
+- Code quality reports
 
 ---
 
@@ -416,16 +453,16 @@ Generate HTML report with metrics:
 Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 **Good First Issues:**
-- Configuration file support
-- Enhanced dry-run mode
-- Module documentation generation
-- Custom naming strategies
+- Editor plugins (VS Code, IntelliJ, Vim)
+- Enhanced dry-run mode with diff output
+- Metrics dashboard implementation
+- Pre-commit hook templates
 
 **Advanced Issues:**
-- Trait implementation support
-- Macro expansion
+- Macro expansion support
 - LSP integration
 - Workspace-level refactoring
+- Editor plugins
 
 ---
 
@@ -437,7 +474,7 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Preview mode enhancement
 - ✅ Circular dependency detection
 
-### v0.2.1 (Current Release)
+### v0.2.1 (Released)
 - ✅ Generic type parameters preservation
 - ✅ Lifetime parameters handling
 - ✅ #[cfg] and attribute preservation
@@ -451,11 +488,25 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Domain-specific module naming (serialization, CRUD, predicates, builders, etc.)
 - ✅ Generated code validation
 
-### v0.3.0
-- Incremental refactoring
-- Custom naming strategies
-- Integration test generation
-- Benchmarking suite
+### v0.2.2 (Released)
+- ✅ Incremental refactoring mode with merge strategies
+- ✅ Custom naming strategies (snake_case, domain-specific, kebab-case)
+- ✅ Integration test generation (--generate-tests)
+- ✅ NamingStrategy trait for extensibility
+- ✅ Enhanced configuration with naming and incremental options
+- ✅ Test suite expanded to 62 tests (53 unit + 9 integration)
+
+### v0.2.3 (Released)
+- ✅ Workspace-level refactoring (--workspace)
+- ✅ Parallel module generation with rayon (--parallel)
+- ✅ Enhanced error recovery (--continue-on-error, --rollback)
+- ✅ CI/CD templates (GitHub Actions, GitLab CI)
+- ✅ Test suite expanded to 73 tests (64 unit + 9 integration)
+
+### v0.3.0 (Next Release)
+- Macro expansion support
+- LSP integration exploration
+- Metrics dashboard
 
 ### v1.0.0 (Production Ready)
 - All critical features implemented
@@ -466,5 +517,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2025-10-02
-**Maintainers:** OxiRS Contributors
+**Last Updated:** 2025-12-27
+**Maintainers:** COOLJAPAN OU (Team KitaSan)

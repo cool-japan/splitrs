@@ -143,6 +143,12 @@ pub struct SplitRsConfig {
 
     /// Whether to enable impl block splitting
     pub split_impl_blocks: bool,
+
+    /// Enable incremental refactoring mode
+    pub incremental: bool,
+
+    /// Generate verification tests after refactoring
+    pub generate_tests: bool,
 }
 
 impl Default for SplitRsConfig {
@@ -151,6 +157,8 @@ impl Default for SplitRsConfig {
             max_lines: 1000,
             max_impl_lines: 500,
             split_impl_blocks: false,
+            incremental: false,
+            generate_tests: false,
         }
     }
 }
@@ -159,22 +167,40 @@ impl Default for SplitRsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NamingConfig {
+    /// Naming strategy: "snake_case", "domain-specific", or "kebab-case"
+    pub strategy: String,
+
     /// Suffix for type definition modules (e.g., "user_type")
     pub type_module_suffix: String,
 
     /// Suffix for impl block modules (e.g., "user_impl")
     pub impl_module_suffix: String,
 
-    /// Whether to use snake_case for module names
+    /// Suffix for trait impl modules (e.g., "user_traits")
+    pub trait_module_suffix: String,
+
+    /// Whether to use snake_case for module names (deprecated, use strategy instead)
     pub use_snake_case: bool,
+
+    /// Custom type name mappings for domain-specific naming
+    #[serde(default)]
+    pub custom_type_mappings: std::collections::HashMap<String, String>,
+
+    /// Custom pattern mappings for method groups
+    #[serde(default)]
+    pub custom_pattern_mappings: std::collections::HashMap<String, String>,
 }
 
 impl Default for NamingConfig {
     fn default() -> Self {
         Self {
+            strategy: "snake_case".to_string(),
             type_module_suffix: "_type".to_string(),
             impl_module_suffix: "_impl".to_string(),
+            trait_module_suffix: "_traits".to_string(),
             use_snake_case: true,
+            custom_type_mappings: std::collections::HashMap::new(),
+            custom_pattern_mappings: std::collections::HashMap::new(),
         }
     }
 }

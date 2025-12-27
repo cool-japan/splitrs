@@ -57,9 +57,14 @@
 
 mod config;
 mod dependency_analyzer;
+mod error_recovery;
 mod import_analyzer;
+mod incremental;
 mod method_analyzer;
+mod naming_strategy;
 mod scope_analyzer;
+mod test_generator;
+mod workspace;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -135,6 +140,67 @@ struct Args {
     /// Interactive mode - prompt for confirmation before creating files
     #[arg(short = 'I', long)]
     interactive: bool,
+
+    /// Naming strategy for generated modules
+    ///
+    /// Available strategies: "snake_case" (default), "domain-specific", "kebab-case"
+    #[arg(long)]
+    naming_strategy: Option<String>,
+
+    /// Enable incremental refactoring mode
+    ///
+    /// When enabled, SplitRS will detect existing module structure and only
+    /// refactor new or modified code, preserving manual customizations.
+    #[arg(long)]
+    incremental: bool,
+
+    /// Generate verification tests after refactoring
+    ///
+    /// Creates a test file that verifies all types are exported correctly
+    /// and method signatures are preserved.
+    #[arg(long)]
+    generate_tests: bool,
+
+    /// Merge strategy for incremental refactoring
+    ///
+    /// Available strategies: "smart" (default), "add-only", "replace", "skip-customized"
+    #[arg(long, default_value = "smart")]
+    merge_strategy: String,
+
+    /// Enable workspace mode to process entire Cargo workspaces
+    ///
+    /// When enabled, SplitRS will analyze and refactor all crates in the workspace.
+    #[arg(long)]
+    workspace: bool,
+
+    /// Enable parallel processing for faster refactoring
+    ///
+    /// Uses multiple threads to process files concurrently.
+    #[arg(long)]
+    parallel: bool,
+
+    /// Number of threads for parallel processing (0 = auto)
+    #[arg(long, default_value = "0")]
+    threads: usize,
+
+    /// Enable error recovery mode
+    ///
+    /// When enabled, SplitRS will attempt to continue processing even if
+    /// some files fail to parse, providing partial output.
+    #[arg(long)]
+    continue_on_error: bool,
+
+    /// Enable rollback on failure
+    ///
+    /// Creates backups of modified files and restores them if the operation fails.
+    #[arg(long)]
+    rollback: bool,
+
+    /// Target line count for files (used with --workspace mode)
+    ///
+    /// Files exceeding this limit will be identified for refactoring.
+    #[arg(long, default_value = "500")]
+    target: usize,
 }
 
 /// Information about a Rust type (struct or enum) and its associated impl blocks
@@ -1259,6 +1325,11 @@ fn generate_mod_rs(modules: &[Module], _output_dir: &Path) -> Result<String> {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Handle workspace mode
+    if args.workspace {
+        return run_workspace_mode(&args);
+    }
+
     // Validate input file exists and is readable
     if !args.input.exists() {
         anyhow::bail!(
@@ -1444,6 +1515,28 @@ fn main() -> Result<()> {
         println!();
     }
 
+    // Incremental refactoring: analyze existing structure
+    let incremental_result = if args.incremental {
+        let merge_strategy = match args.merge_strategy.as_str() {
+            "add-only" => incremental::MergeStrategy::AddOnly,
+            "replace" => incremental::MergeStrategy::Replace,
+            "skip-customized" => incremental::MergeStrategy::SkipCustomized,
+            _ => incremental::MergeStrategy::Smart,
+        };
+
+        let mut refactor = incremental::IncrementalRefactor::new(&args.output, merge_strategy);
+        if let Ok(state) = refactor.analyze_existing() {
+            if !state.modules.is_empty() {
+                println!("\n📁 Incremental mode: detected existing structure");
+                refactor.print_existing_state();
+                println!();
+            }
+        }
+        Some(refactor)
+    } else {
+        None
+    };
+
     // Create backup for rollback support
     let backup_dir = std::env::temp_dir().join(format!(".splitrs_backup_{}", std::process::id()));
     if args.input.exists() {
@@ -1465,8 +1558,21 @@ fn main() -> Result<()> {
         }
     }
 
+    // Track incremental stats
+    let mut created_count = 0;
+    let mut skipped_count = 0;
+
     // Write module files
     for module in &modules {
+        // In incremental mode, check if we should skip this module
+        if let Some(ref refactor) = incremental_result {
+            if !refactor.should_update_module(&module.name) {
+                println!("Skipped: {}.rs (has customizations)", module.name);
+                skipped_count += 1;
+                continue;
+            }
+        }
+
         let module_path = args.output.join(format!("{}.rs", module.name));
         let content =
             module.generate_content(&syntax_tree, &analyzer.use_statements, &type_to_module);
@@ -1492,6 +1598,7 @@ fn main() -> Result<()> {
         }
 
         println!("Created: {:?}", module_path);
+        created_count += 1;
     }
 
     // Write mod.rs
@@ -1513,13 +1620,39 @@ fn main() -> Result<()> {
 
     println!("Created: {:?}", mod_path);
 
+    // Generate verification tests if requested
+    if args.generate_tests {
+        let test_path = args.output.join("refactoring_tests.rs");
+        let mut test_gen = test_generator::TestGenerator::new(
+            args.output
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("generated"),
+        );
+        test_gen.collect_from_file(&syntax_tree);
+        let test_content = test_gen.generate_tests();
+
+        fs::write(&test_path, &test_content)
+            .context(format!("Failed to write test file: {:?}", test_path))?;
+        println!("Created: {:?} (verification tests)", test_path);
+    }
+
     println!("\n{}", "=".repeat(60));
     println!("✓ Refactoring complete!");
     println!("{}", "=".repeat(60));
     println!("📊 Statistics:");
     println!("  Original file: {} lines", source_code.lines().count());
-    println!("  Generated {} module files", modules.len());
+    println!("  Created {} module files", created_count);
+    if skipped_count > 0 {
+        println!("  Skipped {} modules (have customizations)", skipped_count);
+    }
     println!("  Total types: {}", analyzer.types.len());
+    if let Some(strategy_name) = &args.naming_strategy {
+        println!("  Naming strategy: {}", strategy_name);
+    }
+    if args.incremental {
+        println!("  Mode: Incremental ({})", args.merge_strategy);
+    }
 
     let total_methods: usize = analyzer
         .types
@@ -1542,6 +1675,9 @@ fn main() -> Result<()> {
     println!("  1. Review the generated modules in {:?}", args.output);
     println!("  2. Run 'cargo check' to verify the refactored code compiles");
     println!("  3. Run your test suite to ensure functionality is preserved");
+    if args.generate_tests {
+        println!("  4. Run 'cargo test' to execute the verification tests");
+    }
 
     if backup_dir.exists() {
         println!("\n📦 Backup: {:?}", backup_dir);
@@ -1549,6 +1685,185 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run SplitRS in workspace mode
+///
+/// Analyzes an entire Cargo workspace and identifies files that exceed
+/// the target line limit for refactoring.
+fn run_workspace_mode(args: &Args) -> Result<()> {
+    use rayon::prelude::*;
+    use workspace::{ParallelProcessor, WorkspaceAnalyzer};
+
+    println!("📦 SplitRS Workspace Mode");
+    println!("{}", "=".repeat(60));
+
+    // Configure parallel processing if enabled
+    if args.parallel {
+        let processor = ParallelProcessor::new(args.threads);
+        processor.configure_pool()?;
+        if args.threads > 0 {
+            println!("  Parallel processing: {} threads", args.threads);
+        } else {
+            println!("  Parallel processing: auto (all available cores)");
+        }
+    }
+
+    // Analyze the workspace
+    let analyzer = WorkspaceAnalyzer::new(&args.input, args.target);
+    let analysis = analyzer.analyze()?;
+
+    // Print summary
+    analyzer.print_summary(&analysis);
+
+    if args.dry_run {
+        println!("\n{}", "=".repeat(60));
+        println!("DRY RUN - No changes made");
+        println!("{}", "=".repeat(60));
+        return Ok(());
+    }
+
+    // Process files that need refactoring
+    if analysis.files_to_refactor.is_empty() {
+        println!("\n✅ No files need refactoring");
+        return Ok(());
+    }
+
+    println!(
+        "\n🔧 Processing {} files...",
+        analysis.files_to_refactor.len()
+    );
+
+    // Initialize error recovery if enabled
+    let rollback_manager = error_recovery::RollbackManager::new(args.rollback);
+    let mut error_collector =
+        error_recovery::ErrorCollector::new().with_continue_on_error(args.continue_on_error);
+
+    let mut processed = 0;
+    let mut failed = 0;
+
+    // Process files (in parallel if enabled)
+    let results: Vec<_> = if args.parallel {
+        analysis
+            .files_to_refactor
+            .par_iter()
+            .map(|file_info| {
+                process_workspace_file(
+                    &file_info.path,
+                    &args.output,
+                    args.max_lines.unwrap_or(args.target),
+                    args.continue_on_error,
+                )
+            })
+            .collect()
+    } else {
+        analysis
+            .files_to_refactor
+            .iter()
+            .map(|file_info| {
+                process_workspace_file(
+                    &file_info.path,
+                    &args.output,
+                    args.max_lines.unwrap_or(args.target),
+                    args.continue_on_error,
+                )
+            })
+            .collect()
+    };
+
+    for result in results {
+        match result {
+            Ok(path) => {
+                println!("  ✅ Processed: {:?}", path);
+                processed += 1;
+            }
+            Err(e) => {
+                let error = error_recovery::DiagnosticError::new(
+                    e.to_string(),
+                    error_recovery::ErrorSeverity::Error,
+                );
+                let should_continue = error_collector.add(error);
+
+                failed += 1;
+
+                if !should_continue {
+                    eprintln!("  ❌ Too many errors, stopping...");
+                    if args.rollback {
+                        eprintln!("  🔄 Rolling back changes...");
+                        rollback_manager.rollback()?;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Print summary
+    println!("\n📊 Workspace Refactoring Summary");
+    println!("{}", "=".repeat(60));
+    println!("  Files processed: {}", processed);
+    println!("  Files failed: {}", failed);
+
+    if error_collector.has_errors() {
+        println!("\n⚠️  Errors encountered:");
+        print!("{}", error_collector.format_all());
+    }
+
+    if args.rollback && failed > 0 {
+        println!("\n🔄 Some files failed. Use --rollback to restore original files.");
+    }
+
+    Ok(())
+}
+
+/// Process a single file in workspace mode
+fn process_workspace_file(
+    input: &Path,
+    output_base: &Path,
+    max_lines: usize,
+    _continue_on_error: bool,
+) -> Result<PathBuf> {
+    // Create output directory based on input file location
+    let file_stem = input
+        .file_stem()
+        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+
+    let output = output_base.join(file_stem);
+    fs::create_dir_all(&output)?;
+
+    // Read and parse the file
+    let source_code = fs::read_to_string(input)?;
+    let syntax_tree = syn::parse_file(&source_code)?;
+
+    // Analyze the file
+    let mut analyzer = FileAnalyzer::new(true, max_lines / 2);
+    analyzer.analyze(&syntax_tree);
+
+    // Group into modules
+    let modules = analyzer.group_by_module(max_lines);
+
+    // Build type-to-module mapping for super:: imports
+    let mut type_to_module: HashMap<String, String> = HashMap::new();
+    for module in &modules {
+        for exported_type in module.get_exported_types() {
+            type_to_module.insert(exported_type, module.name.clone());
+        }
+    }
+
+    // Write modules
+    for module in &modules {
+        let module_path = output.join(format!("{}.rs", module.name));
+        let content =
+            module.generate_content(&syntax_tree, &analyzer.use_statements, &type_to_module);
+        fs::write(&module_path, &content)?;
+    }
+
+    // Write mod.rs
+    let mod_rs_path = output.join("mod.rs");
+    let mod_content = generate_mod_rs(&modules, &output)?;
+    fs::write(&mod_rs_path, &mod_content)?;
+
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1831,6 +2146,55 @@ mod tests {
             found_doc,
             "At least one impl module should preserve doc comments"
         );
+    }
+
+    #[test]
+    fn test_workspace_analyzer() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a minimal Cargo.toml
+        fs::write(
+            temp_dir.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+
+        // Create src directory with a file
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "fn main() {\n    println!(\"Hello\");\n}\n",
+        )
+        .unwrap();
+
+        let analyzer = workspace::WorkspaceAnalyzer::new(temp_dir.path(), 100);
+        let analysis = analyzer.analyze().unwrap();
+
+        assert_eq!(analysis.crates.len(), 1);
+        assert_eq!(analysis.crates[0].name, "test-crate");
+    }
+
+    #[test]
+    fn test_error_recovery_diagnostic() {
+        let error = error_recovery::DiagnosticError::new(
+            "Test error",
+            error_recovery::ErrorSeverity::Error,
+        )
+        .with_location(PathBuf::from("test.rs"), 10, 5)
+        .with_suggestion("Try this fix");
+
+        let formatted = error.format();
+        assert!(formatted.contains("error"));
+        assert!(formatted.contains("test.rs:10:5"));
+        assert!(formatted.contains("Try this fix"));
     }
 
     #[test]
