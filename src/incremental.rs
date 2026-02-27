@@ -458,7 +458,9 @@ impl IncrementalRefactor {
     /// Analyze existing state before refactoring
     pub fn analyze_existing(&mut self) -> Result<&ExistingModuleState> {
         self.analyzer.analyze()?;
-        Ok(self.analyzer.state.as_ref().unwrap())
+        self.analyzer.state.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Incremental analyzer state not initialized after analysis")
+        })
     }
 
     /// Check if a type should be processed or skipped

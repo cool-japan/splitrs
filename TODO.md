@@ -221,7 +221,7 @@ splitrs -i file.rs -o out/ --naming-strategy domain-specific
 
 ### 11. Macro Expansion Support
 **Estimated effort:** 12-15 hours
-**Status:** Research
+**Status:** ✅ IMPLEMENTED (v0.4.0)
 
 Improve handling of declarative and procedural macros:
 
@@ -390,7 +390,7 @@ Provide ready-to-use CI/CD configurations:
 
 ### 20. Metrics Dashboard
 **Estimated effort:** 8-10 hours
-**Status:** Planned
+**Status:** ✅ IMPLEMENTED (v0.4.0)
 
 Generate HTML report with metrics:
 
@@ -510,10 +510,19 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Library API for external usage
 - ✅ Test suite expanded to 99 tests (84 unit + 15 integration)
 
-### v0.3.0 (Next Release)
-- Macro expansion support
-- LSP integration exploration
-- Metrics dashboard
+### v0.3.0 (Released)
+- ✅ Field access tracking (`field_access_tracker.rs`)
+- ✅ Trait method tracking (`trait_method_tracker.rs`)
+- ✅ No-unwrap policy compliance in production code
+- ✅ Refactored main.rs into file_analyzer.rs + module_generator.rs
+- ✅ Dependencies upgraded (toml 1.0, rayon 1.11)
+- ✅ Codebase: 10,187 lines across 23 Rust files
+
+### v0.4.0 (Released 2026-02-27)
+- ✅ Macro analyzer (macro_rules! detection, derive tracking, placement suggestions)
+- ✅ Metrics dashboard (cyclomatic complexity, HTML/JSON/text reports)
+- ✅ Library API enhanced with file_analyzer, module_generator public modules
+- LSP integration (deferred to v0.5.0)
 
 ### v1.0.0 (Production Ready)
 - All critical features implemented
@@ -524,5 +533,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2025-12-27
+**Last Updated:** 2026-02-26
 **Maintainers:** COOLJAPAN OU (Team KitaSan)

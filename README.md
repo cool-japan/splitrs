@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/splitrs.svg)](https://crates.io/crates/splitrs)
 [![Documentation](https://docs.rs/splitrs/badge.svg)](https://docs.rs/splitrs)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **A production-ready Rust refactoring tool that intelligently splits large files into maintainable modules**
 
@@ -466,52 +466,43 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.2.1 - Latest)
+### Implemented Features (v0.3.0 - Latest)
 
-**v0.2.1 Highlights:**
-- ✅ Generic type parameters & lifetime preservation
-- ✅ Attribute preservation (#[cfg], doc comments, etc.)
-- ✅ Unicode identifier support with smart sanitization
-- ✅ Domain-specific module naming (serialization, CRUD, predicates, etc.)
-- ✅ Comprehensive benchmarking suite (Criterion)
-- ✅ Integration test suite (42 total tests)
-- ✅ Enhanced error messages with actionable suggestions
-- ✅ Generated code validation
+**v0.3.0 Highlights:**
+- ✅ Field access tracking for smarter module splitting
+- ✅ Trait method tracking for coherent trait splitting
+- ✅ No-unwrap policy compliance (production code)
+- ✅ Refactored main.rs into file_analyzer.rs + module_generator.rs
+- ✅ Dependencies upgraded (toml 1.0, rayon 1.11)
 
-**v0.2.0 Features:**
+**v0.2.x Features:**
 - ✅ Configuration file support (`.splitrs.toml`)
-- ✅ Trait implementation separation
-- ✅ Type alias resolution
-- ✅ Circular dependency detection (DFS + DOT export)
-- ✅ Enhanced preview mode with statistics
-- ✅ Interactive confirmation mode
-- ✅ Automatic rollback support
-- ✅ Smart documentation generation
+- ✅ Trait implementation separation & trait bound tracking
+- ✅ Type alias resolution & circular dependency detection
+- ✅ Incremental refactoring with merge strategies
+- ✅ Custom naming strategies (snake_case, domain-specific, kebab-case)
+- ✅ Workspace-level refactoring with parallel processing (rayon)
+- ✅ Enhanced error recovery, rollback support
+- ✅ CI/CD templates (GitHub Actions, GitLab CI)
+- ✅ Private helper dependency tracking & glob import analysis
+- ✅ Comprehensive benchmarking suite (Criterion)
 
 ### Roadmap to v1.0
 
-**Current status:** 90% production-ready
+**Current status:** 92% production-ready
 
-**Next features (v0.3.0):**
-- Incremental refactoring (detect existing splits)
-- Custom naming strategies (plugin system)
-- Parallel module generation with rayon
-- Advanced error recovery
-
-**Future enhancements (v0.4.0+):**
+**Next features (v0.4.0+):**
 - Macro expansion support
-- Workspace-level refactoring
-- LSP integration
+- LSP integration exploration
+
+**Future enhancements (v0.5.0+):**
 - Editor plugins (VS Code, IntelliJ)
+- Cross-language support exploration
+- AI-assisted refactoring
 
 ## 📄 License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0).
 
 ## 🙏 Acknowledgments
 

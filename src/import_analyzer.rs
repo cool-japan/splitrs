@@ -115,7 +115,7 @@ impl ImportAnalyzer {
         // Extract simple patterns like "use foo::Bar"
         if let Some(last_segment) = use_str.split("::").last() {
             let type_name = last_segment.trim_end_matches(';').trim();
-            if !type_name.is_empty() && type_name.chars().next().unwrap().is_uppercase() {
+            if !type_name.is_empty() && type_name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 self.type_mappings.insert(
                     type_name.to_string(),
                     use_str
@@ -317,7 +317,7 @@ impl<'ast> Visit<'ast> for TypeVisitor {
                 if let Some(segment) = path.path.segments.last() {
                     // Might be a type name (like enum variant)
                     let name = segment.ident.to_string();
-                    if name.chars().next().unwrap().is_uppercase() {
+                    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                         self.types_used.insert(name);
                     }
                 }

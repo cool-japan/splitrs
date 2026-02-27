@@ -5,6 +5,58 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-28
+
+### Added
+- **Metrics Dashboard**: New `metrics_dashboard.rs` module for refactoring impact analysis
+  - Cyclomatic complexity analysis for all methods using AST visitor pattern
+  - `ComplexityAnalyzer` with `analyze_file()`, `analyze_method()`, `analyze_fn()` methods
+  - `DashboardGenerator` with HTML, JSON, and text report formats
+  - HTML reports with embedded CSS, Mermaid dependency graphs, color-coded complexity
+  - New CLI flags: `--metrics`, `--metrics-output`, `--metrics-format`
+- **Macro Analyzer**: New `macro_analyzer.rs` module for macro detection and categorization
+  - Detects `macro_rules!` definitions with export status and usage counts
+  - Tracks `#[derive]` usage per type, distinguishing standard vs custom derives
+  - `MacroPlacement` suggestions for optimal module placement after splitting
+  - Integrated into `FileAnalyzer` for automatic macro analysis during file processing
+  - Summary output showing macro counts and custom derives during refactoring
+- **Library API Enhanced**: New public modules exposed:
+  - `pub mod file_analyzer` — file analysis logic
+  - `pub mod module_generator` — module generation logic
+  - `pub mod macro_analyzer` — macro analysis
+  - `pub mod metrics_dashboard` — metrics and reporting
+- **Field Access Tracker**: New `FieldAccessTracker` module (579 lines) for tracking field access patterns
+  - Detects field access across impl blocks for smarter module splitting
+  - Groups methods that share field access patterns
+  - Prevents breaking field visibility when splitting modules
+- **Trait Method Tracker**: New `TraitMethodTracker` module (205 lines) for tracking trait method usage
+  - Tracks trait method dependencies across types
+  - Ensures trait method implementations stay coherent after splitting
+
+### Changed
+- **Dependencies Upgraded**:
+  - `toml`: 0.9 → 1.0 (major version bump)
+  - `rayon`: 1.10 → 1.11
+- **No-Unwrap Policy Compliance**: Eliminated all `unwrap()` usage in production code
+  - All remaining `unwrap()` calls are confined to `#[cfg(test)]` modules only
+  - Production code uses proper error handling with `anyhow::Result` throughout
+- `FileAnalyzer` now includes `MacroAnalyzer` integration for automatic macro tracking
+- **Codebase Statistics**:
+  - Code: 8,264 lines (↑ 1,053 from 0.2.4)
+  - Total Rust lines: 10,187 (↑ 1,307 from 0.2.4)
+  - Total Files: 23 Rust files
+
+### Refactored
+- **Main Module Split**: Refactored `main.rs` into separate focused modules following <2000 lines policy
+  - Extracted `file_analyzer.rs` (707 lines) — file analysis logic
+  - Extracted `module_generator.rs` (944 lines) — module generation logic
+  - `main.rs` reduced to 1,222 lines (from previously larger monolith)
+- **Module Organization**: All source files now comply with the <2000 lines policy
+
+### Performance
+- All existing performance characteristics maintained
+- New analyzers add minimal overhead to the analysis pipeline
+
 ## [0.2.4] - 2025-12-27
 
 ### Added
