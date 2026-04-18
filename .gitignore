@@ -9,9 +9,15 @@ Cargo.lock
 *.swo
 *~
 
+# Claude AI config
+**/.claude/
+
 # macOS
 .DS_Store
 
 # Test outputs
 /tmp/
 *.log
+
+# Rustc ICE dumps
+rustc-ice-*.txt

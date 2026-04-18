@@ -528,3 +528,19 @@ Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www
 ---
 
 **Made with ❤️ by the OxiRS team** | **Star ⭐ us on GitHub!**
+
+## Sponsorship
+
+SplitRS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find SplitRS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
+
