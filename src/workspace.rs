@@ -130,9 +130,10 @@ impl WorkspaceAnalyzer {
             }
         }
 
-        if stats.total_files > 0 {
-            stats.avg_lines_per_file = stats.total_lines / stats.total_files;
-        }
+        stats.avg_lines_per_file = stats
+            .total_lines
+            .checked_div(stats.total_files)
+            .unwrap_or(0);
 
         Ok(WorkspaceAnalysis {
             workspace,

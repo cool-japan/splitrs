@@ -221,7 +221,7 @@ splitrs -i file.rs -o out/ --naming-strategy domain-specific
 
 ### 11. Macro Expansion Support
 **Estimated effort:** 12-15 hours
-**Status:** ✅ IMPLEMENTED (v0.4.0)
+**Status:** ✅ IMPLEMENTED (v0.3.0)
 
 Improve handling of declarative and procedural macros:
 
@@ -289,14 +289,16 @@ splitrs -i file.rs -o out/ --generate-tests
 
 ### 14. LSP Integration
 **Estimated effort:** 15-20 hours
-**Status:** Research
+**Status:** ✅ IMPLEMENTED (v0.3.1)
 
-Provide Language Server Protocol integration:
+Provides Language Server Protocol integration via the `splitrs-lsp` binary:
 
-- Real-time refactoring suggestions in editor
-- Quick-fix actions for large files
-- Preview refactoring in editor
-- Integration with rust-analyzer
+- New `splitrs-lsp` binary (tower-lsp, tokio, stdio transport)
+- Diagnostics for files/impl-blocks exceeding configured line limits
+- Code action `Refactor with splitrs` (REFACTOR_EXTRACT kind)
+- Hover showing file metrics (LoC, method count, avg complexity)
+- `.splitrs.toml` config watch with hot reload
+- Feature-gated: `lsp = ["dep:tower-lsp", "dep:tokio", "dep:dashmap"]`, default-on
 
 ---
 
@@ -386,11 +388,16 @@ Provide ready-to-use CI/CD configurations:
 - Vim/Neovim plugin
 - Emacs package
 
+- [ ] VSCode extension (TypeScript) consuming splitrs-lsp
+- [ ] IntelliJ plugin (Kotlin) consuming splitrs-lsp
+- [ ] Vim/Neovim plugin (Lua) auto-attaching splitrs-lsp
+- [ ] Emacs package (Elisp) auto-attaching splitrs-lsp
+
 ---
 
 ### 20. Metrics Dashboard
 **Estimated effort:** 8-10 hours
-**Status:** ✅ IMPLEMENTED (v0.4.0)
+**Status:** ✅ IMPLEMENTED (v0.3.0)
 
 Generate HTML report with metrics:
 
@@ -517,12 +524,17 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Refactored main.rs into file_analyzer.rs + module_generator.rs
 - ✅ Dependencies upgraded (toml 1.0, rayon 1.11)
 - ✅ Codebase: 10,187 lines across 23 Rust files
-
-### v0.4.0 (Released 2026-02-27)
 - ✅ Macro analyzer (macro_rules! detection, derive tracking, placement suggestions)
 - ✅ Metrics dashboard (cyclomatic complexity, HTML/JSON/text reports)
 - ✅ Library API enhanced with file_analyzer, module_generator public modules
-- LSP integration (deferred to v0.5.0)
+
+### v0.3.1 (Released 2026-04-25)
+- ✅ LSP Integration: `splitrs-lsp` binary based on `tower-lsp`, providing diagnostics, code actions, hover, and config watch
+- ✅ Batched trait implementations into shared modules to reduce per-type file clutter (commit 288228f)
+- ✅ Accurate line count estimation via `prettyplease` formatting, eliminating size drift (commit 288228f)
+- ✅ Conditional `lib.rs` preservation — writes `mod.rs` instead of overwriting the crate root (commit 288228f)
+- ✅ Deduplicated `std::collections` import handling across split modules (commit 288228f)
+- ✅ Test suite: 269 tests passing
 
 ### v1.0.0 (Production Ready)
 - All critical features implemented
@@ -533,5 +545,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2026-02-26
+**Last Updated:** 2026-04-25
 **Maintainers:** COOLJAPAN OU (Team KitaSan)

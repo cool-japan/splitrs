@@ -29,6 +29,17 @@ SplitRS uses AST-based analysis to automatically refactor large Rust source file
 - 🔄 **Automatic Rollback Support**: Backup creation for safe refactoring
 - 📝 **Smart Documentation**: Auto-generated module docs with trait listings
 
+### v0.3.x Features
+- 🔬 **Macro Analyzer**: Detects `macro_rules!` definitions and `#[derive]` usage with placement suggestions
+- 📊 **Metrics Dashboard**: Cyclomatic complexity analysis with HTML/JSON/text reports (`--metrics`)
+- 🗂️ **Field Access Tracker**: Detects field access patterns to prevent broken visibility during splits
+- 🔗 **Trait Method Tracker**: Ensures trait method implementations stay coherent after splitting
+- 🖥️ **LSP Integration** (`splitrs-lsp`): Language server for real-time refactoring guidance
+  - Diagnostics for oversized files and impl blocks
+  - Code action `Refactor with splitrs` (applies a `WorkspaceEdit`)
+  - Hover showing file metrics (LoC, methods, complexity)
+  - `.splitrs.toml` config watch with hot reload
+
 ## 📦 Installation
 
 ```bash
@@ -91,6 +102,39 @@ Then simply run:
 
 ```bash
 splitrs --input src/large_file.rs --output src/large_file/
+```
+
+### LSP Integration (Editor Support)
+
+`splitrs-lsp` is included when you `cargo install splitrs` (LSP is a default feature).
+
+Add to your editor's LSP config:
+
+**Neovim (nvim-lspconfig):**
+```lua
+require('lspconfig').splitrs_lsp.setup{}
+-- Or manually:
+vim.lsp.start({ name = 'splitrs-lsp', cmd = { 'splitrs-lsp' } })
+```
+
+**Helix (`languages.toml`):**
+```toml
+[[language]]
+name = "rust"
+language-servers = ["rust-analyzer", "splitrs-lsp"]
+
+[language-server.splitrs-lsp]
+command = "splitrs-lsp"
+```
+
+The LSP server provides:
+- 🔴 Diagnostics when files exceed your `.splitrs.toml` `max_lines` limit
+- ⚡ Code action `Refactor with splitrs` to split directly from your editor
+- ℹ️ Hover at line 1 showing file metrics
+
+To use LSP-only build without the full CLI:
+```bash
+cargo install splitrs --no-default-features --features lsp
 ```
 
 ## 📖 Examples
@@ -352,11 +396,14 @@ Tested on real-world codebases:
 
 ## 🧪 Testing
 
-SplitRS includes comprehensive tests:
+SplitRS includes **269 comprehensive tests** covering all analysis components:
 
 ```bash
-# Run all tests
-cargo test
+# Run all tests (recommended)
+cargo nextest run --all-features
+
+# Or with the built-in test runner
+cargo test --all-features
 
 # Test on example files
 cargo run -- --input examples/large_struct.rs --output /tmp/test_output
@@ -466,9 +513,18 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.0 - Latest)
+### Implemented Features (v0.3.1 - Latest)
+
+**v0.3.1 Highlights:**
+- ✅ LSP Integration (`splitrs-lsp` binary, tower-lsp, diagnostics, code actions, hover, config watch)
+- ✅ Batched trait implementations into shared modules to reduce file clutter
+- ✅ Accurate line count estimation via `prettyplease` formatting
+- ✅ Conditional `lib.rs` preservation (writes `mod.rs` instead of overwriting the crate root)
+- ✅ Deduplicated `std::collections` import handling across split modules
 
 **v0.3.0 Highlights:**
+- ✅ Macro Analyzer (`macro_rules!` detection, `#[derive]` tracking, placement suggestions)
+- ✅ Metrics Dashboard (cyclomatic complexity, HTML/JSON/text reports)
 - ✅ Field access tracking for smarter module splitting
 - ✅ Trait method tracking for coherent trait splitting
 - ✅ No-unwrap policy compliance (production code)
@@ -489,14 +545,13 @@ cargo test
 
 ### Roadmap to v1.0
 
-**Current status:** 92% production-ready
+**Current status:** 95% production-ready
 
 **Next features (v0.4.0+):**
-- Macro expansion support
-- LSP integration exploration
+- Macro expansion support (full `cargo expand` integration)
+- Editor plugins (VS Code extension, IntelliJ plugin)
 
 **Future enhancements (v0.5.0+):**
-- Editor plugins (VS Code, IntelliJ)
 - Cross-language support exploration
 - AI-assisted refactoring
 

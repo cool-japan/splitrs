@@ -16,11 +16,10 @@ use crate::method_analyzer::{ImplBlockAnalyzer, MethodGroup};
 use crate::module_generator::Module;
 use crate::scope_analyzer::{self, ScopeAnalyzer};
 use crate::trait_method_tracker::TraitMethodTracker;
-use quote::ToTokens;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use syn::{File, Item, ItemImpl};
+use syn::{File, ImplItem, Item, ItemImpl};
 
 /// Information about a Rust type (struct or enum) and its associated impl blocks
 ///
@@ -415,14 +414,79 @@ impl FileAnalyzer {
         let mut modules = Vec::new();
         let mut module_name_counts: HashMap<String, usize> = HashMap::new();
 
-        // Process types with trait implementations
-        for type_info in self.types.values() {
-            if !type_info.trait_impls.is_empty() {
-                // Create a module for trait implementations
-                let mut trait_module =
-                    Module::new(format!("{}_traits", type_info.name.to_lowercase()));
-                trait_module.type_name_for_traits = Some(type_info.name.clone());
-                trait_module.trait_impls = type_info.trait_impls.clone();
+        // Process types with trait implementations.
+        //
+        // Enhancement: instead of one module per type, pack multiple types' trait impls
+        // together into shared modules up to `max_lines`, so that files with many small
+        // trait impls don't explode into dozens of tiny 1-impl modules.
+        {
+            // Collect all (type_name, trait_impls) pairs that have trait impls
+            let mut trait_groups: Vec<(String, Vec<TraitImplInfo>)> = self
+                .types
+                .values()
+                .filter(|t| !t.trait_impls.is_empty())
+                .map(|t| (t.name.clone(), t.trait_impls.clone()))
+                .collect();
+            // Sort by type name for deterministic output
+            trait_groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+            // Pack into batched modules
+            let mut current_trait_module_impls: Vec<TraitImplInfo> = Vec::new();
+            let mut current_trait_module_types: Vec<String> = Vec::new();
+            let mut current_trait_lines: usize = 0;
+            let mut trait_batch_index: usize = 0;
+
+            for (type_name, trait_impls) in trait_groups {
+                // Estimate lines for all trait impls of this type
+                let group_lines: usize = trait_impls
+                    .iter()
+                    .map(|ti| {
+                        prettyplease::unparse(&syn::File {
+                            shebang: None,
+                            attrs: Vec::new(),
+                            items: vec![ti.impl_item.clone()],
+                        })
+                        .lines()
+                        .count()
+                    })
+                    .sum();
+
+                // If adding this group would exceed max_lines and we have content, flush
+                if current_trait_lines + group_lines > max_lines
+                    && !current_trait_module_impls.is_empty()
+                {
+                    let module_name = if trait_batch_index == 0 {
+                        "trait_impls".to_string()
+                    } else {
+                        format!("trait_impls_{}", trait_batch_index)
+                    };
+                    let mut trait_module = Module::new(module_name);
+                    // Use the first type name as the primary label for doc comments
+                    trait_module.type_name_for_traits = current_trait_module_types.first().cloned();
+                    trait_module.trait_impls = current_trait_module_impls.clone();
+                    modules.push(trait_module);
+
+                    trait_batch_index += 1;
+                    current_trait_module_impls.clear();
+                    current_trait_module_types.clear();
+                    current_trait_lines = 0;
+                }
+
+                current_trait_module_impls.extend(trait_impls);
+                current_trait_module_types.push(type_name);
+                current_trait_lines += group_lines;
+            }
+
+            // Flush remaining
+            if !current_trait_module_impls.is_empty() {
+                let module_name = if trait_batch_index == 0 {
+                    "trait_impls".to_string()
+                } else {
+                    format!("trait_impls_{}", trait_batch_index)
+                };
+                let mut trait_module = Module::new(module_name);
+                trait_module.type_name_for_traits = current_trait_module_types.first().cloned();
+                trait_module.trait_impls = current_trait_module_impls;
                 modules.push(trait_module);
             }
         }
@@ -434,33 +498,94 @@ impl FileAnalyzer {
                 let _strategy = self.get_organization_strategy(&type_info.name);
                 let visibility = self.get_field_visibility(&type_info.name);
 
-                // Create a module for this type with split impl blocks
+                // Create modules for this type with split impl blocks.
+                // Batch multiple MethodGroups into a single module file when
+                // their combined line count fits under max_lines, so we don't
+                // produce hundreds of tiny files for types with many small methods.
                 for (impl_block, method_groups) in &type_info.large_impls {
-                    for group in method_groups.iter() {
-                        let base_name = if method_groups.len() == 1 {
-                            format!("{}_impl", type_info.name.to_lowercase())
-                        } else {
-                            format!("{}_{}", type_info.name.to_lowercase(), group.suggest_name())
+                    // Estimate accurate line count for each group using prettyplease.
+                    // The heuristic in MethodInfo.line_count (token_lines * 15) wildly
+                    // overestimates. Instead, build a synthetic impl block from the
+                    // group's methods and measure the formatted output.
+                    let groups_with_sizes: Vec<(usize, &MethodGroup)> = method_groups
+                        .iter()
+                        .map(|g| {
+                            let impl_items: Vec<ImplItem> = g
+                                .methods
+                                .iter()
+                                .map(|m| ImplItem::Fn(m.item.clone()))
+                                .collect();
+                            let synthetic = Item::Impl(ItemImpl {
+                                attrs: impl_block.attrs.clone(),
+                                defaultness: impl_block.defaultness,
+                                unsafety: impl_block.unsafety,
+                                impl_token: impl_block.impl_token,
+                                generics: impl_block.generics.clone(),
+                                trait_: impl_block.trait_.clone(),
+                                self_ty: impl_block.self_ty.clone(),
+                                brace_token: impl_block.brace_token,
+                                items: impl_items,
+                            });
+                            let lines = prettyplease::unparse(&File {
+                                shebang: None,
+                                attrs: Vec::new(),
+                                items: vec![synthetic],
+                            })
+                            .lines()
+                            .count();
+                            (lines, g)
+                        })
+                        .collect();
+
+                    // Batch groups so each batch stays under max_lines
+                    let mut batch: Vec<&MethodGroup> = Vec::new();
+                    let mut batch_lines: usize = 0;
+                    let base_impl_name = format!("{}_impl", type_info.name.to_lowercase());
+
+                    // Helper to emit one batched module
+                    let emit_batch =
+                        |batch: &[&MethodGroup],
+                         module_name_counts: &mut HashMap<String, usize>,
+                         modules: &mut Vec<Module>| {
+                            if batch.is_empty() {
+                                return;
+                            }
+                            // Merge all groups in the batch into one combined MethodGroup
+                            let mut combined = (*batch[0]).clone();
+                            for g in &batch[1..] {
+                                combined.methods.extend(g.methods.iter().cloned());
+                            }
+
+                            let module_name =
+                                if let Some(count) = module_name_counts.get(&base_impl_name) {
+                                    let unique_name = format!("{}_{}", base_impl_name, count + 1);
+                                    module_name_counts.insert(base_impl_name.clone(), count + 1);
+                                    unique_name
+                                } else {
+                                    module_name_counts.insert(base_impl_name.clone(), 0);
+                                    base_impl_name.clone()
+                                };
+
+                            let mut module = Module::new(module_name);
+                            module.impl_type_name = Some(type_info.name.clone());
+                            module.impl_self_ty = Some(impl_block.self_ty.clone());
+                            module.impl_generics = Some(impl_block.generics.clone());
+                            module.impl_attrs = impl_block.attrs.clone();
+                            module.method_group = Some(combined);
+                            modules.push(module);
                         };
 
-                        // Ensure unique module names
-                        let module_name = if let Some(count) = module_name_counts.get(&base_name) {
-                            let unique_name = format!("{}_{}", base_name, count + 1);
-                            module_name_counts.insert(base_name.clone(), count + 1);
-                            unique_name
-                        } else {
-                            module_name_counts.insert(base_name.clone(), 0);
-                            base_name
-                        };
-
-                        let mut module = Module::new(module_name);
-                        module.impl_type_name = Some(type_info.name.clone());
-                        module.impl_self_ty = Some(impl_block.self_ty.clone());
-                        module.impl_generics = Some(impl_block.generics.clone());
-                        module.impl_attrs = impl_block.attrs.clone();
-                        module.method_group = Some(group.clone());
-                        modules.push(module);
+                    for (group_lines, group) in &groups_with_sizes {
+                        if batch_lines + group_lines > max_lines && !batch.is_empty() {
+                            emit_batch(&batch, &mut module_name_counts, &mut modules);
+                            batch = Vec::new();
+                            batch_lines = 0;
+                        }
+                        batch.push(group);
+                        batch_lines += group_lines;
                     }
+                    // Flush remaining batch
+                    emit_batch(&batch, &mut module_name_counts, &mut modules);
                 }
 
                 // Create main module for the type definition
@@ -699,14 +824,29 @@ impl FileAnalyzer {
 impl TypeInfo {
     /// Estimates the total number of lines for this type and its impl blocks
     ///
-    /// This is a rough estimate based on the token stream representation,
-    /// used for determining module size constraints.
+    /// Uses prettyplease to format each item for an accurate line count that matches
+    /// the final output, since the compressed token stream representation significantly
+    /// underestimates actual formatted code size.
     pub(crate) fn estimate_lines(&self) -> usize {
-        let item_lines = self.item.to_token_stream().to_string().lines().count();
+        let item_lines = prettyplease::unparse(&syn::File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: vec![self.item.clone()],
+        })
+        .lines()
+        .count();
         let impl_lines: usize = self
             .impls
             .iter()
-            .map(|i| i.to_token_stream().to_string().lines().count())
+            .map(|i| {
+                prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![i.clone()],
+                })
+                .lines()
+                .count()
+            })
             .sum();
         item_lines + impl_lines
     }

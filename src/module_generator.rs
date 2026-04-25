@@ -376,7 +376,33 @@ impl Module {
         }
 
         // Output filtered use statements
+        // Also track which collection/std symbols were already emitted so we don't duplicate them.
+        let mut already_imported: HashSet<String> = HashSet::new();
+        // Pre-scan ALL original use statements (not just use_items) so that std::collections
+        // imports from the original file are always tracked, preventing duplicate generation.
+        for orig_item in original_use_statements.iter() {
+            let orig_str = quote::quote!(#orig_item).to_string();
+            if orig_str.contains("collections") {
+                for sym in Self::extract_imported_symbols(&orig_str) {
+                    already_imported.insert(sym);
+                }
+            }
+        }
         if !use_items.is_empty() {
+            // Also scan use_items for std::collections imports so we can track them.
+            for item in &use_items {
+                let item_str = prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![item.clone()],
+                });
+                // If this use statement covers std::collections, extract individual type names.
+                if item_str.contains("std::collections") {
+                    for sym in Self::extract_imported_symbols(&item_str) {
+                        already_imported.insert(sym);
+                    }
+                }
+            }
             let formatted = prettyplease::unparse(&syn::File {
                 shebang: None,
                 attrs: Vec::new(),
@@ -415,8 +441,7 @@ impl Module {
                 .push(type_name);
         }
 
-        // Track which symbols have been imported to avoid duplicates
-        let mut already_imported: HashSet<String> = HashSet::new();
+        // already_imported was initialized above when scanning use_items for std::collections.
 
         let mut has_super_imports = !imports_by_module.is_empty();
         for (module_name, mut types) in imports_by_module {
@@ -495,16 +520,19 @@ impl Module {
 
         // For impl block modules, generate context-aware imports
         if let Some(type_name) = &self.impl_type_name {
-            // Import std collections if needed (check if used)
+            // Import std collections if needed (check if used and not already imported)
             if used_symbols.contains("HashMap") || used_symbols.contains("HashSet") {
-                let mut collections = Vec::new();
-                if used_symbols.contains("HashMap") {
+                let mut collections: Vec<&str> = Vec::new();
+                if used_symbols.contains("HashMap") && !already_imported.contains("HashMap") {
                     collections.push("HashMap");
                 }
-                if used_symbols.contains("HashSet") {
+                if used_symbols.contains("HashSet") && !already_imported.contains("HashSet") {
                     collections.push("HashSet");
                 }
                 if !collections.is_empty() {
+                    for c in &collections {
+                        already_imported.insert(c.to_string());
+                    }
                     content.push_str(&format!(
                         "use std::collections::{{{}}};\n",
                         collections.join(", ")
@@ -512,20 +540,25 @@ impl Module {
                 }
             }
 
-            // Import the type from its actual module (or fall back to pattern)
-            if let Some(module_name) = type_to_module.get(type_name) {
-                if module_name != &self.name {
-                    content.push_str(&format!("use super::{}::{};\n", module_name, type_name));
+            // Import the type from its actual module (or fall back to pattern),
+            // but only if it hasn't already been imported by the super:: imports block above.
+            if !already_imported.contains(type_name) {
+                if let Some(module_name) = type_to_module.get(type_name) {
+                    if module_name != &self.name {
+                        content.push_str(&format!("use super::{}::{};\n", module_name, type_name));
+                        already_imported.insert(type_name.clone());
+                    }
+                } else {
+                    // Fall back to the pattern-based name
+                    let type_module_name = format!("{}_type", type_name.to_lowercase());
+                    content.push_str(&format!(
+                        "use super::{}::{};\n",
+                        type_module_name, type_name
+                    ));
+                    already_imported.insert(type_name.clone());
                 }
-            } else {
-                // Fall back to the pattern-based name
-                let type_module_name = format!("{}_type", type_name.to_lowercase());
-                content.push_str(&format!(
-                    "use super::{}::{};\n",
-                    type_module_name, type_name
-                ));
+                content.push('\n');
             }
-            content.push('\n');
         }
 
         // Generate impl block from method group if this is a split impl module
@@ -588,26 +621,32 @@ impl Module {
             }
         }
 
-        // Generate imports for types used
+        // Generate imports for types used (only if not already imported from the original preamble)
         if !types_used.is_empty() {
             let needs_collections = types_used.iter().any(|t| {
-                t == "HashMap"
+                (t == "HashMap"
                     || t == "HashSet"
                     || t == "BTreeMap"
                     || t == "BTreeSet"
-                    || t == "VecDeque"
+                    || t == "VecDeque")
+                    && !already_imported.contains(t.as_str())
             });
 
             if needs_collections {
-                let collection_types: Vec<_> = types_used
+                let mut collection_types: Vec<String> = types_used
                     .iter()
                     .filter(|t| {
                         ["HashMap", "HashSet", "BTreeMap", "BTreeSet", "VecDeque"]
                             .contains(&t.as_str())
+                            && !already_imported.contains(t.as_str())
                     })
                     .cloned()
                     .collect();
+                collection_types.sort();
                 if !collection_types.is_empty() {
+                    for c in &collection_types {
+                        already_imported.insert(c.clone());
+                    }
                     content.push_str(&format!(
                         "use std::collections::{{{}}};\n",
                         collection_types.join(", ")

@@ -551,25 +551,30 @@ fn main() -> Result<()> {
         created_count += 1;
     }
 
-    // Write mod.rs (preserve test module reference if present)
-    let test_module_path = extract_test_module_path(&syntax_tree);
-    let mod_content = generate_mod_rs(&modules, &args.output, test_module_path.as_deref())?;
-    let mod_path = args.output.join("mod.rs");
-    fs::write(&mod_path, &mod_content).context(format!(
-        "Failed to write mod.rs file: {:?}\n\
-         Please ensure you have write permissions for the output directory.",
-        mod_path
-    ))?;
+    // Write mod.rs only when lib.rs does NOT exist in the output directory.
+    // When splitting a crate's src/ directory, lib.rs is the entry point and
+    // we must not overwrite or shadow it with a mod.rs.
+    let lib_rs_path = args.output.join("lib.rs");
+    if !lib_rs_path.exists() {
+        let test_module_path = extract_test_module_path(&syntax_tree);
+        let mod_content = generate_mod_rs(&modules, &args.output, test_module_path.as_deref())?;
+        let mod_path = args.output.join("mod.rs");
+        fs::write(&mod_path, &mod_content).context(format!(
+            "Failed to write mod.rs file: {:?}\n\
+             Please ensure you have write permissions for the output directory.",
+            mod_path
+        ))?;
 
-    // Validate mod.rs
-    if let Err(e) = syn::parse_file(&mod_content) {
-        eprintln!(
-            "⚠️  Warning: Generated mod.rs may contain syntax errors: {}",
-            e
-        );
+        // Validate mod.rs
+        if let Err(e) = syn::parse_file(&mod_content) {
+            eprintln!(
+                "⚠️  Warning: Generated mod.rs may contain syntax errors: {}",
+                e
+            );
+        }
+
+        println!("Created: {:?}", mod_path);
     }
-
-    println!("Created: {:?}", mod_path);
 
     // Generate verification tests if requested
     if args.generate_tests {
@@ -884,11 +889,16 @@ fn process_workspace_file(
         fs::write(&module_path, &content)?;
     }
 
-    // Write mod.rs (preserve test module reference if present)
-    let test_module_path = extract_test_module_path(&syntax_tree);
-    let mod_rs_path = output.join("mod.rs");
-    let mod_content = generate_mod_rs(&modules, &output, test_module_path.as_deref())?;
-    fs::write(&mod_rs_path, &mod_content)?;
+    // Write mod.rs only when lib.rs does NOT exist in the output directory.
+    // When splitting a crate's src/ directory, lib.rs is the entry point and
+    // we must not overwrite or shadow it with a mod.rs.
+    let lib_rs_check = output.join("lib.rs");
+    if !lib_rs_check.exists() {
+        let test_module_path = extract_test_module_path(&syntax_tree);
+        let mod_rs_path = output.join("mod.rs");
+        let mod_content = generate_mod_rs(&modules, &output, test_module_path.as_deref())?;
+        fs::write(&mod_rs_path, &mod_content)?;
+    }
 
     Ok(output)
 }

@@ -27,3 +27,6 @@ pub mod metrics_dashboard;
 pub mod naming_strategy;
 pub mod test_generator;
 pub mod workspace;
+
+#[cfg(feature = "lsp")]
+pub mod lsp;

@@ -5,6 +5,30 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-25
+
+### Added
+- **LSP Integration** (`splitrs-lsp` binary, feature-gated `lsp = ["dep:tower-lsp", "dep:tokio", "dep:dashmap"]`, default-on)
+  - `tower-lsp`-based language server communicating over stdio
+  - Diagnostics for files exceeding `.splitrs.toml`'s `max_lines` threshold
+  - Per-impl-block diagnostics when `split_impl_blocks = true` and impl exceeds `max_impl_lines`
+  - Code action `Refactor with splitrs` (kind `REFACTOR_EXTRACT`) that splits the file and applies a `WorkspaceEdit`
+  - Hover at file top showing real-time metrics: LoC, method count, max impl size, average cyclomatic complexity
+  - `.splitrs.toml` config file watch with hot reload via `did_change_watched_files`
+  - New `[[bin]] splitrs-lsp` entry (required-features = `["lsp"]`) — install with `cargo install splitrs` (default features include LSP)
+
+### Changed
+- **Trait Implementation Batching**: trait impls for the same type are now grouped into a single shared module to reduce per-type file clutter (commit 288228f)
+- **Accurate Line Count Estimation**: `prettyplease`-formatted output is used to compute line counts, eliminating drift between estimated and final module sizes (commit 288228f)
+- **lib.rs Preservation**: when the output target is the crate root, splitrs writes `mod.rs` rather than overwriting an existing `lib.rs` (commit 288228f)
+- **Import Deduplication**: `std::collections::*` imports are now deduplicated across split modules (commit 288228f)
+
+### Dependencies
+- Added (optional, behind `lsp` feature, enabled by default):
+  - `tower-lsp = "0.20.0"`
+  - `tokio = "1.52.1"` (features: `rt-multi-thread`, `macros`, `io-std`, `sync`)
+  - `dashmap = "6.1.0"`
+
 ## [0.3.0] - 2026-02-28
 
 ### Added

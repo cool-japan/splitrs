@@ -1,7 +1,7 @@
 //! Method boundary detection and analysis for splitting large impl blocks
 
 use std::collections::{HashMap, HashSet};
-use syn::{visit::Visit, Expr, ExprCall, ExprMethodCall, ImplItem, ImplItemFn, ItemImpl};
+use syn::{visit::Visit, Expr, ExprCall, ExprMethodCall, File, ImplItem, ImplItemFn, ItemImpl};
 
 /// Information about a method within an impl block
 #[derive(Clone)]
@@ -45,16 +45,24 @@ impl ImplBlockAnalyzer {
         let mut visitor = MethodCallVisitor::new();
         visitor.visit_impl_item_fn(method);
 
-        // Use heuristic for line count since token stream loses formatting
-        // Average Rust method is 25-35 lines; use token stream as base and multiply
-        let token_lines = quote::ToTokens::to_token_stream(method)
-            .to_string()
-            .lines()
-            .count();
-
-        // Heuristic: multiply by 15 to approximate real formatting
-        // A 2-line token stream method is typically ~30 lines in real code
-        let line_count = token_lines.max(1) * 15;
+        // Use prettyplease for accurate line count measurement instead of heuristics.
+        // Wrapping the method in a synthetic file gives us the formatted line count.
+        let line_count = {
+            let synthetic_file = File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: vec![syn::Item::Fn(syn::ItemFn {
+                    attrs: method.attrs.clone(),
+                    vis: method.vis.clone(),
+                    sig: method.sig.clone(),
+                    block: Box::new(method.block.clone()),
+                })],
+            };
+            prettyplease::unparse(&synthetic_file)
+                .lines()
+                .count()
+                .max(1)
+        };
 
         MethodInfo {
             name,
@@ -87,37 +95,15 @@ impl ImplBlockAnalyzer {
     }
 
     fn find_clusters(&self, _graph: &HashMap<String, HashSet<String>>) -> Vec<Vec<String>> {
-        // Simple clustering: group methods that call each other
-        let mut clusters: Vec<Vec<String>> = Vec::new();
-        let mut assigned: HashSet<String> = HashSet::new();
-
-        for method in &self.methods {
-            if assigned.contains(&method.name) {
-                continue;
-            }
-
-            let mut cluster = vec![method.name.clone()];
-            assigned.insert(method.name.clone());
-
-            // Find methods that this method calls or that call this method
-            for other_method in &self.methods {
-                if assigned.contains(&other_method.name) {
-                    continue;
-                }
-
-                let calls_other = method.calls_methods.contains(&other_method.name);
-                let called_by_other = other_method.calls_methods.contains(&method.name);
-
-                if calls_other || called_by_other {
-                    cluster.push(other_method.name.clone());
-                    assigned.insert(other_method.name.clone());
-                }
-            }
-
-            clusters.push(cluster);
-        }
-
-        clusters
+        // Place each method into its own cluster.
+        //
+        // Previous transitive clustering (A→B and B→C → all 3 in one cluster) caused
+        // giant impl blocks (e.g. ContractGenerator with 100+ methods calling each
+        // other) to collapse into a single unbreakable cluster, defeating the line-
+        // limit splitting entirely.  The batching logic in `group_by_module` in
+        // file_analyzer.rs already handles merging small adjacent clusters up to
+        // max_lines, so fine-grained individual clusters are the correct output here.
+        self.methods.iter().map(|m| vec![m.name.clone()]).collect()
     }
 
     fn create_groups(&self, clusters: Vec<Vec<String>>, max_lines: usize) -> Vec<MethodGroup> {
