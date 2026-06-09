@@ -9,16 +9,18 @@
 // internal API shared between the lib and bin compilation units.
 #![allow(dead_code)]
 
+use crate::config::{self, TargetModule};
 use crate::field_access_tracker::FieldAccessTracker;
 use crate::helper_dependency_tracker::HelperDependencyTracker;
 use crate::macro_analyzer::MacroAnalyzer;
 use crate::method_analyzer::{ImplBlockAnalyzer, MethodGroup};
-use crate::module_generator::Module;
+use crate::module_generator::{Module, RefVisitor};
 use crate::scope_analyzer::{self, ScopeAnalyzer};
 use crate::trait_method_tracker::TraitMethodTracker;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use syn::visit::Visit;
 use syn::{File, ImplItem, Item, ItemImpl};
 
 /// Information about a Rust type (struct or enum) and its associated impl blocks
@@ -27,41 +29,41 @@ use syn::{File, ImplItem, Item, ItemImpl};
 /// when splitting it into modules, including the type definition itself,
 /// its impl blocks, and any large impl blocks that need to be split.
 #[derive(Clone)]
-pub(crate) struct TypeInfo {
+pub struct TypeInfo {
     /// Name of the type (struct or enum name)
-    pub(crate) name: String,
+    pub name: String,
 
     /// The type definition item (struct or enum)
-    pub(crate) item: Item,
+    pub item: Item,
 
     /// Regular inherent impl blocks for this type (`impl Type { ... }`)
-    pub(crate) impls: Vec<Item>,
+    pub impls: Vec<Item>,
 
     /// Trait implementation blocks (`impl Trait for Type { ... }`)
-    pub(crate) trait_impls: Vec<TraitImplInfo>,
+    pub trait_impls: Vec<TraitImplInfo>,
 
     /// Documentation comments associated with the type
-    pub(crate) doc_comments: Vec<String>,
+    pub doc_comments: Vec<String>,
 
     /// Large impl blocks that should be split into separate modules
     ///
     /// Each tuple contains the original impl block and the groups of methods
     /// it should be split into, as determined by dependency analysis.
-    pub(crate) large_impls: Vec<(ItemImpl, Vec<MethodGroup>)>,
+    pub large_impls: Vec<(ItemImpl, Vec<MethodGroup>)>,
 }
 
 /// Information about a trait implementation
 #[derive(Clone)]
-pub(crate) struct TraitImplInfo {
+pub struct TraitImplInfo {
     /// Name of the trait being implemented
-    pub(crate) trait_name: String,
+    pub trait_name: String,
 
     /// The trait impl block
-    pub(crate) impl_item: Item,
+    pub impl_item: Item,
 
     /// Whether this is an unsafe impl
     #[allow(dead_code)]
-    pub(crate) is_unsafe: bool,
+    pub is_unsafe: bool,
 }
 
 /// Core analyzer that processes a Rust file and determines how to split it
@@ -72,15 +74,15 @@ pub(crate) struct TraitImplInfo {
 /// - Tracking standalone items (functions, constants, etc.)
 /// - Coordinating with the scope analyzer for proper module placement
 /// - Tracking helper function dependencies for cross-module visibility
-pub(crate) struct FileAnalyzer {
+pub struct FileAnalyzer {
     /// Map of type names to their information
-    pub(crate) types: HashMap<String, TypeInfo>,
+    pub types: HashMap<String, TypeInfo>,
 
     /// Items that aren't type definitions (functions, constants, etc.)
-    pub(crate) standalone_items: Vec<Item>,
+    pub standalone_items: Vec<Item>,
 
     /// Use statements from the original file
-    pub(crate) use_statements: Vec<Item>,
+    pub use_statements: Vec<Item>,
 
     /// Whether to enable impl block splitting
     split_impl_blocks: bool,
@@ -98,10 +100,30 @@ pub(crate) struct FileAnalyzer {
     field_tracker: FieldAccessTracker,
 
     /// Tracker for trait method calls
-    pub(crate) trait_tracker: TraitMethodTracker,
+    pub trait_tracker: TraitMethodTracker,
 
     /// Analyzer for macro rules definitions and derive usage
-    pub(crate) macro_analyzer: MacroAnalyzer,
+    pub macro_analyzer: MacroAnalyzer,
+
+    /// Whether to extract inline `#[cfg(test)] mod NAME { ... }` blocks
+    /// into a separate `tests.rs` file. Set via [`Self::set_extract_tests`].
+    extract_tests: bool,
+
+    /// Inline test modules collected when `extract_tests` is enabled.
+    /// Each entry is the original `Item::Mod` that was removed from
+    /// `standalone_items` and held aside for emission into `tests.rs`.
+    pub extracted_tests: Vec<Item>,
+
+    /// Named target-module routing rules. When non-empty, items are routed
+    /// to the matching module name before falling through to the existing
+    /// `types.rs`/`functions.rs` heuristic. Set via
+    /// [`Self::set_target_modules`].
+    target_modules: Vec<TargetModule>,
+
+    /// Item #5: File-level `//!` inner doc attributes captured from the
+    /// parsed `syn::File.attrs`. These are emitted at the top of `mod.rs`
+    /// and the primary module file to preserve crate/module documentation.
+    pub file_inner_docs: Vec<syn::Attribute>,
 }
 
 impl FileAnalyzer {
@@ -111,7 +133,7 @@ impl FileAnalyzer {
     ///
     /// * `split_impl_blocks` - Whether to enable experimental impl block splitting
     /// * `max_impl_lines` - Maximum lines per impl block before splitting
-    pub(crate) fn new(split_impl_blocks: bool, max_impl_lines: usize) -> Self {
+    pub fn new(split_impl_blocks: bool, max_impl_lines: usize) -> Self {
         Self {
             types: HashMap::new(),
             standalone_items: Vec::new(),
@@ -123,7 +145,36 @@ impl FileAnalyzer {
             field_tracker: FieldAccessTracker::new(),
             trait_tracker: TraitMethodTracker::new(),
             macro_analyzer: MacroAnalyzer::new(),
+            extract_tests: false,
+            extracted_tests: Vec::new(),
+            target_modules: Vec::new(),
+            file_inner_docs: Vec::new(),
         }
+    }
+
+    /// Enable or disable inline-test extraction (Feature A).
+    ///
+    /// When enabled, [`Self::analyze`] diverts inline `#[cfg(test)] mod ...`
+    /// blocks into [`Self::extracted_tests`] rather than appending them to
+    /// `standalone_items`.
+    pub fn set_extract_tests(&mut self, enabled: bool) {
+        self.extract_tests = enabled;
+    }
+
+    /// Install target-module routing rules (Feature B).
+    ///
+    /// Rules are evaluated in order during [`Self::group_by_module`]; the
+    /// first matching rule wins. An empty list disables routing.
+    pub fn set_target_modules(&mut self, rules: Vec<TargetModule>) {
+        self.target_modules = rules;
+    }
+
+    /// Drain the collected inline test modules, leaving the analyzer empty.
+    ///
+    /// Used by the binary after `analyze` to produce the `tests.rs` output
+    /// file. Repeated calls return successively empty vectors.
+    pub fn take_extracted_tests(&mut self) -> Vec<Item> {
+        std::mem::take(&mut self.extracted_tests)
     }
 
     /// Analyzes a parsed Rust file and extracts type information
@@ -131,7 +182,18 @@ impl FileAnalyzer {
     /// This method performs two passes:
     /// 1. Analyzes all types to build scope information
     /// 2. Processes each item to extract types, impls, and determine splitting strategy
-    pub(crate) fn analyze(&mut self, file: &File) {
+    pub fn analyze(&mut self, file: &File) {
+        // Item #5: Capture file-level `//!` inner doc attributes
+        self.file_inner_docs = file
+            .attrs
+            .iter()
+            .filter(|attr| {
+                // Inner doc attrs have `style = Inner` and path `doc`
+                matches!(attr.style, syn::AttrStyle::Inner(_)) && attr.path().is_ident("doc")
+            })
+            .cloned()
+            .collect();
+
         // Analyze macros (macro_rules! definitions and #[derive] attributes)
         self.macro_analyzer.analyze_file(file);
 
@@ -250,10 +312,22 @@ impl FileAnalyzer {
                 }
                 Item::Mod(mod_item) => {
                     // Skip test modules with #[path = "..."] attribute - they're handled separately
-                    let is_test_module = Self::is_test_module_with_path(mod_item);
-                    if !is_test_module {
-                        self.standalone_items.push(item.clone());
+                    let is_test_with_path = Self::is_test_module_with_path(mod_item);
+                    if is_test_with_path {
+                        continue;
                     }
+
+                    // When --extract-tests is enabled, divert inline
+                    // `#[cfg(test)] mod NAME { ... }` blocks into a side
+                    // channel for emission into `tests.rs`. These are
+                    // distinct from external test files (handled above)
+                    // by virtue of having an inline body (`content`).
+                    if self.extract_tests && Self::is_inline_test_module(mod_item) {
+                        self.extracted_tests.push(item.clone());
+                        continue;
+                    }
+
+                    self.standalone_items.push(item.clone());
                 }
                 _ => {
                     // Other items (type aliases, etc.) go to standalone
@@ -272,7 +346,7 @@ impl FileAnalyzer {
     ///
     /// Detects `#[cfg(test)] #[path = "..."] mod tests;` patterns
     /// and analyzes those files for field accesses to ensure proper visibility.
-    pub(crate) fn analyze_with_test_files(&mut self, file: &File, input_path: &Path) {
+    pub fn analyze_with_test_files(&mut self, file: &File, input_path: &Path) {
         // First do the regular analysis
         self.analyze(file);
 
@@ -382,6 +456,33 @@ impl FileAnalyzer {
         is_test && has_path
     }
 
+    /// Check whether a module is an *inline* `#[cfg(test)] mod NAME { ... }`
+    /// block — that is, gated on `cfg(test)`, with a brace-delimited body
+    /// (no external `#[path]` redirect, no bare `mod NAME;` declaration).
+    fn is_inline_test_module(mod_item: &syn::ItemMod) -> bool {
+        if mod_item.content.is_none() {
+            return false; // bare `mod foo;` declaration
+        }
+
+        let mut is_test = false;
+        let mut has_path = false;
+        for attr in &mod_item.attrs {
+            let meta_path = attr.path();
+            if let Some(ident) = meta_path.get_ident() {
+                if ident == "cfg" {
+                    if let syn::Meta::List(meta_list) = &attr.meta {
+                        if meta_list.tokens.to_string().contains("test") {
+                            is_test = true;
+                        }
+                    }
+                } else if ident == "path" {
+                    has_path = true;
+                }
+            }
+        }
+        is_test && !has_path
+    }
+
     /// Get recommended visibility for a type's fields based on impl organization
     ///
     /// When impl blocks are split into separate modules, fields may need to be
@@ -410,89 +511,81 @@ impl FileAnalyzer {
     /// # Returns
     ///
     /// A vector of modules, each containing related types and items.
-    pub(crate) fn group_by_module(&self, max_lines: usize) -> Vec<Module> {
+    pub fn group_by_module(&self, max_lines: usize) -> Vec<Module> {
         let mut modules = Vec::new();
         let mut module_name_counts: HashMap<String, usize> = HashMap::new();
 
-        // Process types with trait implementations.
+        // Feature B: route items by `target_modules` rules BEFORE the
+        // heuristic passes. Routed items are added to named modules and
+        // removed from the heuristic input pools below.
+        let routing = self.compute_target_routing();
+
+        // Item #3: Per-type trait-impl grouping.
         //
-        // Enhancement: instead of one module per type, pack multiple types' trait impls
-        // together into shared modules up to `max_lines`, so that files with many small
-        // trait impls don't explode into dozens of tiny 1-impl modules.
+        // Instead of packing all types' trait impls into shared `trait_impls.rs`
+        // modules, each type gets its own `<type>_traits.rs` (with batching within
+        // that type when it exceeds max_lines).
         {
             // Collect all (type_name, trait_impls) pairs that have trait impls
+            // (skipping any type already routed to a named target module).
             let mut trait_groups: Vec<(String, Vec<TraitImplInfo>)> = self
                 .types
                 .values()
                 .filter(|t| !t.trait_impls.is_empty())
+                .filter(|t| !routing.routed_type_names.contains(&t.name))
                 .map(|t| (t.name.clone(), t.trait_impls.clone()))
                 .collect();
             // Sort by type name for deterministic output
             trait_groups.sort_by(|a, b| a.0.cmp(&b.0));
 
-            // Pack into batched modules
-            let mut current_trait_module_impls: Vec<TraitImplInfo> = Vec::new();
-            let mut current_trait_module_types: Vec<String> = Vec::new();
-            let mut current_trait_lines: usize = 0;
-            let mut trait_batch_index: usize = 0;
-
+            // For each type, batch its own trait impls within the line budget
             for (type_name, trait_impls) in trait_groups {
-                // Estimate lines for all trait impls of this type
-                let group_lines: usize = trait_impls
-                    .iter()
-                    .map(|ti| {
-                        prettyplease::unparse(&syn::File {
-                            shebang: None,
-                            attrs: Vec::new(),
-                            items: vec![ti.impl_item.clone()],
-                        })
-                        .lines()
-                        .count()
+                let base_traits_name = format!("{}_traits", type_name.to_lowercase());
+                let mut current_impls: Vec<TraitImplInfo> = Vec::new();
+                let mut current_lines: usize = 0;
+
+                for ti in trait_impls {
+                    let impl_lines = prettyplease::unparse(&syn::File {
+                        shebang: None,
+                        attrs: Vec::new(),
+                        items: vec![ti.impl_item.clone()],
                     })
-                    .sum();
+                    .lines()
+                    .count();
 
-                // If adding this group would exceed max_lines and we have content, flush
-                if current_trait_lines + group_lines > max_lines
-                    && !current_trait_module_impls.is_empty()
-                {
-                    let module_name = if trait_batch_index == 0 {
-                        "trait_impls".to_string()
-                    } else {
-                        format!("trait_impls_{}", trait_batch_index)
-                    };
-                    let mut trait_module = Module::new(module_name);
-                    // Use the first type name as the primary label for doc comments
-                    trait_module.type_name_for_traits = current_trait_module_types.first().cloned();
-                    trait_module.trait_impls = current_trait_module_impls.clone();
-                    modules.push(trait_module);
+                    // Flush if adding would exceed budget and we have content
+                    if current_lines + impl_lines > max_lines && !current_impls.is_empty() {
+                        let module_name =
+                            pick_unique_module_name(&base_traits_name, &mut module_name_counts);
+                        let mut trait_module = Module::new(module_name);
+                        trait_module.type_name_for_traits = Some(type_name.clone());
+                        trait_module.trait_impls = current_impls.clone();
+                        modules.push(trait_module);
+                        current_impls.clear();
+                        current_lines = 0;
+                    }
 
-                    trait_batch_index += 1;
-                    current_trait_module_impls.clear();
-                    current_trait_module_types.clear();
-                    current_trait_lines = 0;
+                    current_impls.push(ti);
+                    current_lines += impl_lines;
                 }
 
-                current_trait_module_impls.extend(trait_impls);
-                current_trait_module_types.push(type_name);
-                current_trait_lines += group_lines;
-            }
-
-            // Flush remaining
-            if !current_trait_module_impls.is_empty() {
-                let module_name = if trait_batch_index == 0 {
-                    "trait_impls".to_string()
-                } else {
-                    format!("trait_impls_{}", trait_batch_index)
-                };
-                let mut trait_module = Module::new(module_name);
-                trait_module.type_name_for_traits = current_trait_module_types.first().cloned();
-                trait_module.trait_impls = current_trait_module_impls;
-                modules.push(trait_module);
+                // Flush remaining
+                if !current_impls.is_empty() {
+                    let module_name =
+                        pick_unique_module_name(&base_traits_name, &mut module_name_counts);
+                    let mut trait_module = Module::new(module_name);
+                    trait_module.type_name_for_traits = Some(type_name.clone());
+                    trait_module.trait_impls = current_impls;
+                    modules.push(trait_module);
+                }
             }
         }
 
         // Process types with large impl blocks separately
         for type_info in self.types.values() {
+            if routing.routed_type_names.contains(&type_info.name) {
+                continue;
+            }
             if !type_info.large_impls.is_empty() {
                 // Determine organization strategy and visibility for this type
                 let _strategy = self.get_organization_strategy(&type_info.name);
@@ -556,15 +649,18 @@ impl FileAnalyzer {
                                 combined.methods.extend(g.methods.iter().cloned());
                             }
 
-                            let module_name =
-                                if let Some(count) = module_name_counts.get(&base_impl_name) {
-                                    let unique_name = format!("{}_{}", base_impl_name, count + 1);
-                                    module_name_counts.insert(base_impl_name.clone(), count + 1);
-                                    unique_name
+                            // Item #2: Semantic naming — use suggest_name() if it returns a
+                            // real semantic name (not "methods" and not ending with "_group").
+                            let semantic = combined.suggest_name();
+                            let preferred_name =
+                                if semantic != "methods" && !semantic.ends_with("_group") {
+                                    format!("{}_{}", type_info.name.to_lowercase(), semantic)
                                 } else {
-                                    module_name_counts.insert(base_impl_name.clone(), 0);
                                     base_impl_name.clone()
                                 };
+
+                            let module_name =
+                                pick_unique_module_name(&preferred_name, module_name_counts);
 
                             let mut module = Module::new(module_name);
                             module.impl_type_name = Some(type_info.name.clone());
@@ -612,6 +708,7 @@ impl FileAnalyzer {
             .types
             .values()
             .filter(|t| t.large_impls.is_empty())
+            .filter(|t| !routing.routed_type_names.contains(&t.name))
             .collect();
 
         for type_info in regular_types {
@@ -623,7 +720,20 @@ impl FileAnalyzer {
                 current_lines = 0;
             }
 
-            current_module.types.push(type_info.clone());
+            // Bundle only the type definition and its inherent impls here. The
+            // type's trait impls are emitted separately by the per-type
+            // trait-impl grouping above (each non-empty type gets its own
+            // `<type>_traits` module), so keeping them on the bundled `TypeInfo`
+            // would emit them twice and produce `error[E0119]: conflicting
+            // implementations`.
+            current_module.types.push(TypeInfo {
+                name: type_info.name.clone(),
+                item: type_info.item.clone(),
+                impls: type_info.impls.clone(),
+                trait_impls: Vec::new(),
+                doc_comments: type_info.doc_comments.clone(),
+                large_impls: type_info.large_impls.clone(),
+            });
             current_lines += type_lines;
         }
 
@@ -631,36 +741,165 @@ impl FileAnalyzer {
             modules.push(current_module);
         }
 
-        // Add standalone items to modules, splitting by line count
-        if !self.standalone_items.is_empty() {
-            let mut current_fn_module = Module::new("functions".to_string());
-            let mut current_fn_lines = 0;
-            let mut fn_module_count = 0;
+        // Item #4: Const/Static/Macro/TypeAlias extraction.
+        //
+        // Partition unrouted standalone items into 4 buckets by variant, then
+        // emit each non-empty bucket into its own set of named modules.
+        {
+            let unrouted_standalone: Vec<&Item> = self
+                .standalone_items
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !routing.routed_standalone_indices.contains(idx))
+                .map(|(_, item)| item)
+                .collect();
 
-            for item in &self.standalone_items {
-                // Estimate lines for this item
-                let item_lines = estimate_item_lines(item);
+            let mut const_statics: Vec<&Item> = Vec::new();
+            let mut macros_items: Vec<&Item> = Vec::new();
+            let mut type_aliases: Vec<&Item> = Vec::new();
+            let mut functions: Vec<&Item> = Vec::new();
 
-                // If adding this item would exceed max_lines and we have items, start a new module
-                if current_fn_lines + item_lines > max_lines
-                    && !current_fn_module.standalone_items.is_empty()
-                {
-                    modules.push(current_fn_module);
-                    fn_module_count += 1;
-                    current_fn_module = Module::new(format!("functions_{}", fn_module_count + 1));
-                    current_fn_lines = 0;
+            for item in &unrouted_standalone {
+                match item {
+                    Item::Const(_) | Item::Static(_) => const_statics.push(item),
+                    Item::Macro(_) => macros_items.push(item),
+                    Item::Type(_) => type_aliases.push(item),
+                    _ => functions.push(item),
+                }
+            }
+
+            // Helper: emit one bucket into batched modules with the given base name.
+            // Uses pick_unique_module_name for consistent `_2` / `_3` suffixing.
+            let emit_bucket = |bucket: Vec<&Item>,
+                               base_name: &str,
+                               module_name_counts: &mut HashMap<String, usize>,
+                               modules: &mut Vec<Module>,
+                               max_lines: usize| {
+                if bucket.is_empty() {
+                    return;
+                }
+                // Pick the name for the first module in this bucket
+                let first_name = pick_unique_module_name(base_name, module_name_counts);
+                let mut current_module = Module::new(first_name);
+                let mut current_lines: usize = 0;
+
+                for item in bucket {
+                    let item_lines = estimate_item_lines(item);
+                    if current_lines + item_lines > max_lines
+                        && !current_module.standalone_items.is_empty()
+                    {
+                        // Flush current module and start a new one
+                        modules.push(current_module);
+                        let next_name = pick_unique_module_name(base_name, module_name_counts);
+                        current_module = Module::new(next_name);
+                        current_lines = 0;
+                    }
+                    current_module.standalone_items.push((*item).clone());
+                    current_lines += item_lines;
                 }
 
-                current_fn_module.standalone_items.push(item.clone());
-                current_fn_lines += item_lines;
-            }
+                if !current_module.standalone_items.is_empty() {
+                    modules.push(current_module);
+                }
+            };
 
-            if !current_fn_module.standalone_items.is_empty() {
-                modules.push(current_fn_module);
-            }
+            emit_bucket(
+                const_statics,
+                "constants",
+                &mut module_name_counts,
+                &mut modules,
+                max_lines,
+            );
+            emit_bucket(
+                macros_items,
+                "macros",
+                &mut module_name_counts,
+                &mut modules,
+                max_lines,
+            );
+            emit_bucket(
+                type_aliases,
+                "type_aliases",
+                &mut module_name_counts,
+                &mut modules,
+                max_lines,
+            );
+            emit_bucket(
+                functions,
+                "functions",
+                &mut module_name_counts,
+                &mut modules,
+                max_lines,
+            );
         }
 
+        // Emit named target modules at the end, in the order they were
+        // declared in the config. Empty target modules (those whose patterns
+        // matched nothing) are skipped.
+        modules.extend(routing.into_modules());
+
         modules
+    }
+
+    /// Compute target-module routing assignments based on `self.target_modules`.
+    ///
+    /// Walks every type, standalone item, and impl-on-foreign-type block in
+    /// the analyzer, finds the first matching rule (if any), and accumulates
+    /// the routed payload into per-rule `Module`s. Items not matching any
+    /// rule fall through (are left in their original pool for the heuristic).
+    fn compute_target_routing(&self) -> TargetRouting {
+        let mut routing = TargetRouting::default();
+        if self.target_modules.is_empty() {
+            return routing;
+        }
+
+        // Pre-create one Module per declared target rule, preserving order.
+        // We track them by index alongside a name->index map for fast lookup.
+        let mut modules_by_name: HashMap<String, usize> = HashMap::new();
+        for tm in &self.target_modules {
+            let idx = routing.modules.len();
+            routing.modules.push(Module::new(tm.name.clone()));
+            modules_by_name.insert(tm.name.clone(), idx);
+        }
+
+        // Route types in deterministic order (sorted by type name) so output
+        // ordering doesn't depend on the underlying HashMap iteration order.
+        let mut type_names: Vec<&String> = self.types.keys().collect();
+        type_names.sort();
+        for name in type_names {
+            let Some(type_info) = self.types.get(name) else {
+                continue;
+            };
+            let Some(target_name) = config::route_item(name, &self.target_modules) else {
+                continue;
+            };
+            let Some(&idx) = modules_by_name.get(target_name) else {
+                continue;
+            };
+            // Bundle the type definition + its inherent impls + its trait
+            // impls together (the existing data model bundles by type).
+            routing.modules[idx].types.push(type_info.clone());
+            routing.routed_type_names.insert(name.clone());
+        }
+
+        // Route standalone items by name. We track the index of each routed
+        // item so the heuristic pass can skip it without disturbing ordering.
+        for (idx, item) in self.standalone_items.iter().enumerate() {
+            let name_opt = standalone_routing_name(item);
+            let Some(name) = name_opt else { continue };
+            let Some(target_name) = config::route_item(&name, &self.target_modules) else {
+                continue;
+            };
+            let Some(&module_idx) = modules_by_name.get(target_name) else {
+                continue;
+            };
+            routing.modules[module_idx]
+                .standalone_items
+                .push(item.clone());
+            routing.routed_standalone_indices.insert(idx);
+        }
+
+        routing
     }
 
     /// Compute which private functions need to be made pub(super) for cross-module access
@@ -670,7 +909,7 @@ impl FileAnalyzer {
     /// - A map of (module_name -> HashMap<source_module, Vec<function_names>>) for imports
     /// - A map of (struct_name -> Vec<field_name>) for fields that need visibility upgrade
     #[allow(clippy::type_complexity)]
-    pub(crate) fn compute_cross_module_visibility(
+    pub fn compute_cross_module_visibility(
         &self,
         modules: &[Module],
     ) -> (
@@ -705,63 +944,143 @@ impl FileAnalyzer {
 
         // For each module, check if any of its items call private functions in other modules
         for module in modules {
-            // Collect all function names called by items in this module
-            let mut called_functions: HashSet<String> = HashSet::new();
+            // Collect the names of every function / method *defined* in this
+            // module whose body we must scan for cross-module calls.
+            //
+            // We gather names from the same five locations the previous
+            // implementation walked individually:
+            //   1. standalone free functions,
+            //   2. methods of `impl Trait for f32`-style standalone impl blocks,
+            //   3. trait-impl methods (`module.trait_impls`),
+            //   4. methods of type-bundled inherent + trait impls
+            //      (`module.types[*].impls` / `.trait_impls`),
+            //   5. methods inside split-impl chunks (`module.method_group`).
+            let mut owner_names: Vec<String> = Vec::new();
+
+            let push_impl_methods = |impl_block: &syn::ItemImpl, names: &mut Vec<String>| {
+                for item in &impl_block.items {
+                    if let syn::ImplItem::Fn(method) = item {
+                        names.push(method.sig.ident.to_string());
+                    }
+                }
+            };
 
             for item in &module.standalone_items {
                 match item {
-                    Item::Fn(f) => {
-                        let fn_name = f.sig.ident.to_string();
-                        // Get helpers called by this function
-                        let helpers = self.helper_tracker.get_required_helpers(&fn_name);
-                        called_functions.extend(helpers);
-                    }
-                    Item::Impl(impl_item) => {
-                        // Also check impl blocks in standalone items (e.g., impl Trait for f32)
-                        for item in &impl_item.items {
-                            if let syn::ImplItem::Fn(method) = item {
-                                let method_name = method.sig.ident.to_string();
-                                let helpers =
-                                    self.helper_tracker.get_required_helpers(&method_name);
-                                called_functions.extend(helpers);
-                            }
-                        }
-                    }
+                    Item::Fn(f) => owner_names.push(f.sig.ident.to_string()),
+                    Item::Impl(impl_item) => push_impl_methods(impl_item, &mut owner_names),
                     _ => {}
                 }
             }
 
-            // Check trait impls from TraitImplInfo
             for trait_impl in &module.trait_impls {
                 if let Item::Impl(impl_item) = &trait_impl.impl_item {
-                    for item in &impl_item.items {
-                        if let syn::ImplItem::Fn(method) = item {
-                            let method_name = method.sig.ident.to_string();
-                            let helpers = self.helper_tracker.get_required_helpers(&method_name);
-                            called_functions.extend(helpers);
-                        }
+                    push_impl_methods(impl_item, &mut owner_names);
+                }
+            }
+
+            // Methods bundled with their owning type. The previous version of
+            // this pass only iterated `module.standalone_items`, which missed
+            // cross-module helper calls invoked from these methods — resulting
+            // in `error[E0425]: cannot find function ... in this scope` when the
+            // callee sat in a sibling module like `functions.rs`.
+            for type_info in &module.types {
+                for impl_item in &type_info.impls {
+                    if let Item::Impl(impl_block) = impl_item {
+                        push_impl_methods(impl_block, &mut owner_names);
+                    }
+                }
+                for trait_impl in &type_info.trait_impls {
+                    if let Item::Impl(impl_block) = &trait_impl.impl_item {
+                        push_impl_methods(impl_block, &mut owner_names);
                     }
                 }
             }
 
-            // For each called function, check if it's in a different module
-            for called_fn in &called_functions {
-                if let Some(source_module) = fn_to_module.get(called_fn) {
-                    if source_module != &module.name {
-                        // This function is called from a different module
-                        // Check if it's a private function
-                        if self.helper_tracker.is_private_helper(called_fn) {
-                            needs_pub_super.insert(called_fn.clone());
+            // Methods inside per-impl-chunk modules produced by `--split-impl-blocks`.
+            if let Some(method_group) = &module.method_group {
+                for method in &method_group.methods {
+                    owner_names.push(method.item.sig.ident.to_string());
+                }
+            }
 
-                            // Track the import needed for this module
-                            cross_module_imports
-                                .entry(module.name.clone())
-                                .or_default()
-                                .entry(source_module.clone())
-                                .or_default()
-                                .push(called_fn.clone());
-                        }
-                    }
+            // Derive two call sets from the owners:
+            //   * `private_helper_calls` — private helpers reachable from the
+            //     owners (transitive closure). These need a `pub(super)` upgrade
+            //     *and* an import.
+            //   * `all_calls` — every function directly called by an owner,
+            //     regardless of visibility. A call to a *public* sibling
+            //     function needs an import too, but must NOT be upgraded to
+            //     `pub(super)` (it is already public). Previously these public
+            //     cross-module calls were dropped entirely, producing
+            //     `error[E0425]` for the importing module.
+            let mut private_helper_calls: HashSet<String> = HashSet::new();
+            let mut all_calls: HashSet<String> = HashSet::new();
+            for name in &owner_names {
+                private_helper_calls.extend(self.helper_tracker.get_required_helpers(name));
+                all_calls.extend(self.helper_tracker.get_all_called_functions(name));
+            }
+            // Every private helper we depend on must also be importable.
+            all_calls.extend(private_helper_calls.iter().cloned());
+
+            // For each called function, check if it lives in a different module.
+            for called_fn in &all_calls {
+                let Some(source_module) = fn_to_module.get(called_fn) else {
+                    continue;
+                };
+                if source_module == &module.name {
+                    continue;
+                }
+
+                // Cross-module call: this module needs `use super::<src>::<fn>;`.
+                cross_module_imports
+                    .entry(module.name.clone())
+                    .or_default()
+                    .entry(source_module.clone())
+                    .or_default()
+                    .push(called_fn.clone());
+
+                // Only *private* callees additionally need a visibility upgrade.
+                if self.helper_tracker.is_private_helper(called_fn) {
+                    needs_pub_super.insert(called_fn.clone());
+                }
+            }
+        }
+
+        // Extracted inline tests (`--extract-tests`) move from the original
+        // file's scope into a sibling `tests.rs`. Their bodies frequently call
+        // *private* helpers that previously resolved through the inline module's
+        // `use super::*;`. Once `logit(..)` lives in `functions.rs` and the test
+        // in `tests.rs`, the call no longer resolves — `error[E0425]: cannot find
+        // function logit` / "not accessible". Treat the extracted tests as a
+        // synthetic module named `tests`: any production function they reference
+        // must be importable there (`use super::<module>::<fn>;`) and, when
+        // private, upgraded to `pub(super)`. The reserved key `tests` is consumed
+        // by the `tests.rs` generator. References are gathered from the AST (path
+        // roots), so calls nested inside macros like `assert!(logit(x))` are
+        // captured too.
+        if !self.extracted_tests.is_empty() {
+            let mut refs = RefVisitor::default();
+            for item in &self.extracted_tests {
+                refs.visit_item(item);
+            }
+            for called_fn in &refs.path_roots {
+                let Some(source_module) = fn_to_module.get(called_fn) else {
+                    continue;
+                };
+                // Only *private* helpers need explicit handling: they are upgraded
+                // to `pub(super)` and named directly from `tests.rs`. Public
+                // functions are already re-exported into the test scope via the
+                // `use super::*;` → `pub use <module>::*;` chain, so importing them
+                // again would be redundant (and noisy under `-D warnings`).
+                if self.helper_tracker.is_private_helper(called_fn) {
+                    needs_pub_super.insert(called_fn.clone());
+                    cross_module_imports
+                        .entry("tests".to_string())
+                        .or_default()
+                        .entry(source_module.clone())
+                        .or_default()
+                        .push(called_fn.clone());
                 }
             }
         }
@@ -863,4 +1182,100 @@ fn estimate_item_lines(item: &Item) -> usize {
         items: vec![item.clone()],
     });
     formatted.lines().count()
+}
+
+/// Pick a unique module name using the deduplication counter map.
+///
+/// The naming convention:
+/// - 1st occurrence: `base_name` (no suffix)
+/// - 2nd occurrence: `base_name_2`
+/// - 3rd occurrence: `base_name_3`, etc.
+///
+/// `module_name_counts` maps `base_name → next_suffix` where:
+/// - absent means unseen → emit base_name and store 2 as next suffix
+/// - value N means N is the next suffix to use → emit `base_name_N`, store N+1
+fn pick_unique_module_name(
+    base_name: &str,
+    module_name_counts: &mut HashMap<String, usize>,
+) -> String {
+    match module_name_counts.get(base_name).copied() {
+        None => {
+            // First time: no suffix; next call will use suffix 2
+            module_name_counts.insert(base_name.to_string(), 2);
+            base_name.to_string()
+        }
+        Some(next_suffix) => {
+            let name = format!("{}_{}", base_name, next_suffix);
+            module_name_counts.insert(base_name.to_string(), next_suffix + 1);
+            name
+        }
+    }
+}
+
+/// Result of one routing pass for Feature B (`--target-modules`).
+///
+/// Carries the assembled named modules alongside the indices of the
+/// inputs that were consumed by routing, so the heuristic passes can
+/// filter them out without disturbing the original collection ordering.
+#[derive(Default)]
+struct TargetRouting {
+    /// One `Module` per declared rule, in the order rules were listed in
+    /// the config. Some may be empty if no item matched their patterns.
+    modules: Vec<Module>,
+
+    /// Type names that were routed to a named module. The heuristic passes
+    /// skip these when iterating `self.types`.
+    routed_type_names: HashSet<String>,
+
+    /// Indices into `self.standalone_items` that were routed. The heuristic
+    /// standalone-items pass skips these.
+    routed_standalone_indices: HashSet<usize>,
+}
+
+impl TargetRouting {
+    /// Consume the routing and yield only the non-empty named modules.
+    fn into_modules(self) -> Vec<Module> {
+        self.modules
+            .into_iter()
+            .filter(|m| {
+                !m.types.is_empty()
+                    || !m.standalone_items.is_empty()
+                    || !m.trait_impls.is_empty()
+                    || m.method_group.is_some()
+            })
+            .collect()
+    }
+}
+
+/// Extract a routable name from a standalone item.
+///
+/// Returns the identifier the matching rules should compare against, or
+/// `None` if the item has no externally-visible name (e.g. `use` statements
+/// or non-impl modules without a content identity worth routing on).
+///
+/// For `impl Foo` and `impl Trait for Foo` blocks left in `standalone_items`
+/// (because the type isn't in this file's `types` map), routes by the
+/// impl-target type name.
+fn standalone_routing_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Fn(f) => Some(f.sig.ident.to_string()),
+        Item::Const(c) => Some(c.ident.to_string()),
+        Item::Static(s) => Some(s.ident.to_string()),
+        Item::Type(t) => Some(t.ident.to_string()),
+        Item::Struct(s) => Some(s.ident.to_string()),
+        Item::Enum(e) => Some(e.ident.to_string()),
+        Item::Trait(t) => Some(t.ident.to_string()),
+        Item::Macro(m) => m.ident.as_ref().map(|i| i.to_string()),
+        Item::Impl(i) => impl_target_type_name(i),
+        _ => None,
+    }
+}
+
+/// Extract the type name an impl block targets (`impl Foo` or
+/// `impl Trait for Foo`).
+fn impl_target_type_name(impl_item: &ItemImpl) -> Option<String> {
+    if let syn::Type::Path(type_path) = &*impl_item.self_ty {
+        return type_path.path.segments.last().map(|s| s.ident.to_string());
+    }
+    None
 }

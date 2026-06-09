@@ -151,9 +151,17 @@ fn perform_split_sync(
     // Unlike the CLI, we always rewrite the original file here regardless of
     // whether a lib.rs might exist in out_dir; the LSP caller owns that decision.
     let test_module_path = module_generator::extract_test_module_path(&file);
-    let mod_rs_content =
-        module_generator::generate_mod_rs(&modules, &out_dir, test_module_path.as_deref())
-            .map_err(LspError::from)?;
+    // The LSP path does not currently support --extract-tests, so we pass
+    // `false` here. CLI/binary callers go through `main.rs` and pass the
+    // real flag.
+    let mod_rs_content = module_generator::generate_mod_rs(
+        &modules,
+        &out_dir,
+        test_module_path.as_deref(),
+        false,
+        &[],
+    )
+    .map_err(LspError::from)?;
 
     operations.push(DocumentChangeOperation::Edit(TextDocumentEdit {
         text_document: OptionalVersionedTextDocumentIdentifier {

@@ -224,6 +224,29 @@ impl HelperDependencyTracker {
         Vec::new()
     }
 
+    /// Get every function directly called by `method_name`, regardless of the
+    /// callee's visibility.
+    ///
+    /// Unlike [`get_required_helpers`](Self::get_required_helpers) — which only
+    /// reports *private* helpers (those that need a `pub(super)` upgrade) — this
+    /// returns the raw call set captured for the definition. It is used by the
+    /// cross-module import pass so that calls to *public* sibling functions
+    /// (which do not need a visibility upgrade, but still need a `use
+    /// super::<module>::<fn>;` import in the calling module) are not silently
+    /// dropped.
+    ///
+    /// Returns an empty vector if the name has no recorded definition.
+    pub fn get_all_called_functions(&self, method_name: &str) -> Vec<String> {
+        match self.helper_definitions.get(method_name) {
+            Some(def) => {
+                let mut calls: Vec<String> = def.calls.iter().cloned().collect();
+                calls.sort();
+                calls
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Get all methods that depend on a specific helper
     pub fn get_methods_using_helper(&self, helper_name: &str) -> Vec<String> {
         let mut methods = Vec::new();

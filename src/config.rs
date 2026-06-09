@@ -38,6 +38,27 @@ pub struct Config {
 
     /// Output generation settings
     pub output: OutputConfig,
+
+    /// Target module routing rules
+    ///
+    /// When non-empty, items matching the rules are routed to named output
+    /// modules instead of going through the default heuristic split.
+    /// Rules are evaluated in order; the first match wins.
+    ///
+    /// In `.splitrs.toml`, this section is expressed as a top-level
+    /// `[[target_modules]]` array:
+    ///
+    /// ```toml
+    /// [[target_modules]]
+    /// name = "v3"
+    /// items = ["BoundaryExtV3", "StreamingBoundaryEstimator"]
+    ///
+    /// [[target_modules]]
+    /// name = "core"
+    /// items = ["*"]
+    /// ```
+    #[serde(default, rename = "target_modules")]
+    pub target_modules: Vec<TargetModule>,
 }
 
 impl Config {
@@ -149,6 +170,14 @@ pub struct SplitRsConfig {
 
     /// Generate verification tests after refactoring
     pub generate_tests: bool,
+
+    /// Extract inline `#[cfg(test)] mod NAME { ... }` blocks into a dedicated
+    /// `tests.rs` file in the output directory.
+    ///
+    /// When `true`, inline test modules are removed from heuristic
+    /// categorization (they won't end up in `functions.rs`) and consolidated
+    /// into `tests.rs` with collision-safe renaming.
+    pub extract_tests: bool,
 }
 
 impl Default for SplitRsConfig {
@@ -159,8 +188,108 @@ impl Default for SplitRsConfig {
             split_impl_blocks: false,
             incremental: false,
             generate_tests: false,
+            extract_tests: false,
         }
     }
+}
+
+/// A single named target module with content-routing rules.
+///
+/// Used by Feature B (`--target-modules`) to produce surgical, named splits
+/// instead of the default `types.rs`/`functions.rs` heuristic.
+///
+/// # Pattern matching
+///
+/// Each entry in `items` is matched against item names with the following
+/// semantics, evaluated in order (first-match wins across the rule list):
+///
+/// - **Exact**: `Foo` matches only `Foo`.
+/// - **Prefix glob**: `Foo*` matches anything starting with `Foo`.
+/// - **Suffix glob**: `*Foo` matches anything ending with `Foo`.
+/// - **Wildcard**: `*` matches everything.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TargetModule {
+    /// Output module name. Becomes the filename `<name>.rs`.
+    pub name: String,
+
+    /// Patterns to match against item names (structs, enums, fns, consts,
+    /// statics, impl-target types).
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+/// Standalone wrapper for `--target-modules <FILE>` TOML files.
+///
+/// The dedicated config file may contain just the `[[target_modules]]` array
+/// at the top level. Example:
+///
+/// ```toml
+/// [[target_modules]]
+/// name = "v3"
+/// items = ["FooV3", "BarV3"]
+///
+/// [[target_modules]]
+/// name = "core"
+/// items = ["*"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TargetModulesFile {
+    /// Routing rules. Same shape as the embedded form in `Config`.
+    #[serde(default)]
+    pub target_modules: Vec<TargetModule>,
+}
+
+impl TargetModulesFile {
+    /// Load a target-modules spec from a standalone TOML file.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let contents = fs::read_to_string(path.as_ref())
+            .context("Failed to read target-modules configuration file")?;
+        let spec: TargetModulesFile = toml::from_str(&contents)
+            .context("Failed to parse target-modules TOML configuration")?;
+        Ok(spec)
+    }
+}
+
+/// Check whether an item name matches the given pattern.
+///
+/// Supported patterns:
+/// - `*` (wildcard, matches anything)
+/// - `Foo*` (prefix glob)
+/// - `*Foo` (suffix glob)
+/// - `Foo` (exact match)
+///
+/// Patterns containing `*` in any other position are treated as exact
+/// matches, since the spec only requires the three forms above.
+pub fn matches_pattern(item_name: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        if !prefix.contains('*') {
+            return item_name.starts_with(prefix);
+        }
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if !suffix.contains('*') {
+            return item_name.ends_with(suffix);
+        }
+    }
+    item_name == pattern
+}
+
+/// Route an item name to the first matching target module name, if any.
+///
+/// Rules are evaluated in order; the first rule whose patterns match wins.
+/// Returns the target module's name, or `None` if no rule matches.
+pub fn route_item<'a>(item_name: &str, target_modules: &'a [TargetModule]) -> Option<&'a str> {
+    for tm in target_modules {
+        for pattern in &tm.items {
+            if matches_pattern(item_name, pattern) {
+                return Some(&tm.name);
+            }
+        }
+    }
+    None
 }
 
 /// Module naming configuration
@@ -303,5 +432,123 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn test_extract_tests_default_is_false() {
+        let config = Config::default();
+        assert!(!config.splitrs.extract_tests);
+    }
+
+    #[test]
+    fn test_extract_tests_deserialization() {
+        let toml_str = r#"
+            [splitrs]
+            extract_tests = true
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.splitrs.extract_tests);
+    }
+
+    #[test]
+    fn test_target_modules_embedded_in_main_config() {
+        let toml_str = r#"
+            [splitrs]
+            max_lines = 1000
+
+            [[target_modules]]
+            name = "v3"
+            items = ["FooV3", "BarV3"]
+
+            [[target_modules]]
+            name = "core"
+            items = ["*"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.target_modules.len(), 2);
+        assert_eq!(config.target_modules[0].name, "v3");
+        assert_eq!(config.target_modules[0].items, vec!["FooV3", "BarV3"]);
+        assert_eq!(config.target_modules[1].name, "core");
+        assert_eq!(config.target_modules[1].items, vec!["*"]);
+    }
+
+    #[test]
+    fn test_target_modules_standalone_file() {
+        let toml_str = r#"
+            [[target_modules]]
+            name = "v3"
+            items = ["BoundaryExtV3", "StreamingBoundaryEstimator"]
+
+            [[target_modules]]
+            name = "extended"
+            items = ["BoundaryExt*"]
+        "#;
+        let spec: TargetModulesFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(spec.target_modules.len(), 2);
+        assert_eq!(spec.target_modules[0].name, "v3");
+        assert_eq!(spec.target_modules[1].items, vec!["BoundaryExt*"]);
+    }
+
+    #[test]
+    fn test_matches_pattern_exact() {
+        assert!(matches_pattern("Foo", "Foo"));
+        assert!(!matches_pattern("Foo", "Bar"));
+        assert!(!matches_pattern("FooBar", "Foo"));
+    }
+
+    #[test]
+    fn test_matches_pattern_prefix() {
+        assert!(matches_pattern("FooBar", "Foo*"));
+        assert!(matches_pattern("Foo", "Foo*"));
+        assert!(matches_pattern("FooBarBaz", "Foo*"));
+        assert!(!matches_pattern("Bar", "Foo*"));
+    }
+
+    #[test]
+    fn test_matches_pattern_suffix() {
+        assert!(matches_pattern("MyConfig", "*Config"));
+        assert!(matches_pattern("Config", "*Config"));
+        assert!(!matches_pattern("ConfigPath", "*Config"));
+    }
+
+    #[test]
+    fn test_matches_pattern_wildcard() {
+        assert!(matches_pattern("", "*"));
+        assert!(matches_pattern("AnyThing", "*"));
+        assert!(matches_pattern("foo_bar", "*"));
+    }
+
+    #[test]
+    fn test_route_item_first_match_wins() {
+        let rules = vec![
+            TargetModule {
+                name: "v3".to_string(),
+                items: vec!["FooV3".to_string()],
+            },
+            TargetModule {
+                name: "extended".to_string(),
+                items: vec!["Foo*".to_string()],
+            },
+            TargetModule {
+                name: "core".to_string(),
+                items: vec!["*".to_string()],
+            },
+        ];
+
+        // Exact match wins over prefix glob
+        assert_eq!(route_item("FooV3", &rules), Some("v3"));
+        // Prefix matches the extended bucket
+        assert_eq!(route_item("FooBar", &rules), Some("extended"));
+        // Wildcard catches the rest
+        assert_eq!(route_item("Quux", &rules), Some("core"));
+    }
+
+    #[test]
+    fn test_route_item_no_match_returns_none() {
+        let rules = vec![TargetModule {
+            name: "v3".to_string(),
+            items: vec!["FooV3".to_string()],
+        }];
+        assert_eq!(route_item("Bar", &rules), None);
     }
 }

@@ -1,0 +1,57 @@
+{
+  "name": "splitrs",
+  "displayName": "splitrs — Rust refactoring assistant",
+  "description": "Language server integration for splitrs-lsp: diagnostics, code actions, and hover for Rust file-size refactoring",
+  "version": "0.1.0",
+  "publisher": "cooljapan",
+  "repository": { "type": "git", "url": "https://github.com/cool-japan/splitrs" },
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other", "Programming Languages"],
+  "activationEvents": ["onLanguage:rust", "workspaceContains:**/Cargo.toml"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "splitrs.refactorCurrentFile",
+        "title": "splitrs: Refactor current file",
+        "category": "splitrs"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "splitrs",
+      "properties": {
+        "splitrs.serverPath": {
+          "type": "string",
+          "default": "splitrs-lsp",
+          "description": "Path to the splitrs-lsp binary (defaults to 'splitrs-lsp' on $PATH)"
+        },
+        "splitrs.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable the splitrs language server"
+        },
+        "splitrs.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP communication between VSCode and splitrs-lsp"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "check": "tsc --noEmit -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.6.0"
+  }
+}

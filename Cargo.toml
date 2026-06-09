@@ -1,6 +1,6 @@
 [package]
 name = "splitrs"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "AST-based Rust refactoring tool with trait separation, config files, and intelligent module generation"
@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["lsp"]
 lsp = ["dep:tower-lsp", "dep:tokio", "dep:dashmap"]
+smt = ["dep:oxiz", "dep:num-bigint"]
 
 [dependencies]
 syn = { version = "2.0", features = ["full", "parsing", "printing", "visit"] }
@@ -34,6 +35,9 @@ serde_json = "1.0"
 tower-lsp = { version = "0.20.0", optional = true }
 tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync"], optional = true }
 dashmap = { version = "6.1.0", optional = true }
+# SMT solver for verified refactoring — DEV: relative path (COOLJAPAN: no hardcoded absolute paths).
+oxiz = { version = "0.2.3", optional = true }
+num-bigint = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

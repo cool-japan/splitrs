@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.cooljapan.splitrs</id>
+    <name>splitrs (Rust refactoring assistant)</name>
+    <vendor email="kitahata@terra-intl.com" url="https://github.com/cool-japan/splitrs">COOLJAPAN OU</vendor>
+    <version>0.1.0</version>
+
+    <description><![CDATA[
+        <p>Integrates <a href="https://github.com/cool-japan/splitrs">splitrs</a> into IntelliJ IDEA via the
+        built-in LSP client.</p>
+        <p>Provides:</p>
+        <ul>
+            <li>Diagnostics when a Rust file exceeds your <code>.splitrs.toml</code> <code>max_lines</code> limit</li>
+            <li>A <em>Refactor with splitrs</em> code action to split large files in-editor</li>
+            <li>Hover showing file metrics (lines of code, method count, avg complexity)</li>
+        </ul>
+        <p><strong>Prerequisites:</strong> <code>splitrs-lsp</code> must be on your <code>$PATH</code>
+        (<code>cargo install splitrs</code>). Requires IntelliJ IDEA 2024.2 or later.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <platform.lsp.serverSupportProvider
+            implementation="com.cooljapan.splitrs.SplitrsLspServerSupportProvider"/>
+    </extensions>
+</idea-plugin>

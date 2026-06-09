@@ -72,12 +72,18 @@ impl DataStore {
 
     /// Get connection count
     pub fn connection_count(&self) -> usize {
-        self.connections.lock().unwrap().len()
+        self.connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Add connection
     pub fn add_connection(&self, conn: Connection) {
-        self.connections.lock().unwrap().push(conn);
+        self.connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(conn);
     }
 
     /// Get metrics

@@ -329,6 +329,291 @@ async fn test_hover_at_line_zero() {
     server_handle.abort();
 }
 
+// ── New helpers ──────────────────────────────────────────────────────────────
+
+/// Build a large but syntactically valid Rust fixture file (>1000 lines)
+/// written to `dir`, and return `(Url, file_path)`.
+///
+/// Uses 30 struct+impl pairs (~330 core lines) padded to 1100 to guarantee the
+/// default 1000-line threshold is exceeded.
+fn make_oversized_fixture(dir: &tempfile::TempDir) -> tower_lsp::lsp_types::Url {
+    let mut src = String::new();
+    for i in 0..30usize {
+        src.push_str(&format!(
+            "pub struct Struct{i} {{ pub value: i64 }}\n\
+             impl Struct{i} {{\n\
+             pub fn get(&self) -> i64 {{ self.value }}\n\
+             pub fn set(&mut self, v: i64) {{ self.value = v; }}\n\
+             pub fn double(&self) -> i64 {{ self.value * 2 }}\n\
+             pub fn is_positive(&self) -> bool {{ self.value > 0 }}\n\
+             pub fn add(&self, other: i64) -> i64 {{ self.value + other }}\n\
+             pub fn sub(&self, other: i64) -> i64 {{ self.value - other }}\n\
+             pub fn mul(&self, other: i64) -> i64 {{ self.value * other }}\n\
+             pub fn to_string_repr(&self) -> String {{ format!(\"Struct{i}({{}})\", self.value) }}\n\
+             }}\n",
+        ));
+    }
+    // Pad to ensure > 1000 lines (O(n²) but only runs once per test).
+    while src.lines().count() < 1100 {
+        src.push_str("// padding line\n");
+    }
+    let file_path = dir.path().join("big.rs");
+    std::fs::write(&file_path, &src).expect("write fixture");
+    tower_lsp::lsp_types::Url::from_file_path(&file_path).expect("url from path")
+}
+
+/// Read LSP frames until `workspace/applyEdit` arrives, automatically reply
+/// with `{ applied: true }`, and return the `params.edit` JSON so the caller
+/// can inspect the `WorkspaceEdit`.
+async fn handle_apply_edit_request(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    deadline: Duration,
+) -> Option<serde_json::Value> {
+    let (request_id, edit) = read_until(reader, deadline, |frame| {
+        if frame.get("method") == Some(&serde_json::Value::String("workspace/applyEdit".into())) {
+            let id = frame.get("id")?.clone();
+            let edit = frame["params"]["edit"].clone();
+            Some((id, edit))
+        } else {
+            None
+        }
+    })
+    .await?;
+
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": { "applied": true }
+    });
+    writer
+        .write_all(&lsp_frame(&response))
+        .await
+        .expect("write applyEdit response");
+
+    Some(edit)
+}
+
+// ── New integration tests ─────────────────────────────────────────────────────
+
+/// Test 5: `textDocument/codeAction` returns a single action with kind
+/// `refactor.rewrite` and command `splitrs.split` when a splitrs diagnostic is
+/// present.
+#[tokio::test]
+async fn test_code_action_for_oversize_diagnostic() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let url = make_oversized_fixture(&dir);
+    let src =
+        std::fs::read_to_string(url.to_file_path().expect("url to path")).expect("read fixture");
+
+    let (mut client_read, mut client_write, server_handle) = start_server();
+    do_handshake(&mut client_read, &mut client_write).await;
+
+    // 1. Open the document so the server ingests it and publishes diagnostics.
+    let open_notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": url.to_string(),
+                "languageId": "rust",
+                "version": 1,
+                "text": src
+            }
+        }
+    });
+    client_write
+        .write_all(&lsp_frame(&open_notif))
+        .await
+        .expect("write didOpen");
+
+    // 2. Wait for publishDiagnostics with at least one diagnostic.
+    let diags = read_until(&mut client_read, Duration::from_secs(10), |frame| {
+        if frame.get("method")
+            == Some(&serde_json::Value::String(
+                "textDocument/publishDiagnostics".into(),
+            ))
+        {
+            let arr = frame["params"]["diagnostics"].as_array()?;
+            if arr.is_empty() {
+                None
+            } else {
+                Some(arr.clone())
+            }
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("publishDiagnostics with non-empty diagnostics should arrive within 10 s");
+
+    // 3. Extract the first splitrs diagnostic verbatim for the codeAction context.
+    let first_diag = diags
+        .into_iter()
+        .find(|d| d["source"].as_str() == Some("splitrs"))
+        .expect("at least one splitrs diagnostic");
+
+    // 4. Send textDocument/codeAction carrying that diagnostic in context.
+    let code_action_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": url.to_string() },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 0 }
+            },
+            "context": {
+                "diagnostics": [first_diag]
+            }
+        }
+    });
+    client_write
+        .write_all(&lsp_frame(&code_action_req))
+        .await
+        .expect("write codeAction request");
+
+    // 5. Read the codeAction response (id=3).
+    let result = read_until(&mut client_read, Duration::from_secs(10), |frame| {
+        if frame.get("id") == Some(&serde_json::json!(3)) {
+            Some(frame["result"].clone())
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("codeAction response should arrive within 10 s");
+
+    // 6. Assert exactly one action with the correct kind and command.
+    let actions = result
+        .as_array()
+        .expect("codeAction result should be an array");
+    assert_eq!(actions.len(), 1, "Expected exactly 1 code action");
+
+    let action = &actions[0];
+    assert_eq!(
+        action["kind"].as_str(),
+        Some("refactor.rewrite"),
+        "Code action kind should be refactor.rewrite"
+    );
+    assert_eq!(
+        action["command"]["command"].as_str(),
+        Some("splitrs.split"),
+        "Command should be splitrs.split"
+    );
+
+    server_handle.abort();
+}
+
+/// Test 6: `workspace/executeCommand` triggers a `workspace/applyEdit` round-trip
+/// that produces a non-trivial `WorkspaceEdit` with at least two operations
+/// (Create + TextDocumentEdit).
+#[tokio::test]
+async fn test_execute_command_splits_file_via_apply_edit() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let url = make_oversized_fixture(&dir);
+    let src =
+        std::fs::read_to_string(url.to_file_path().expect("url to path")).expect("read fixture");
+
+    let (mut client_read, mut client_write, server_handle) = start_server();
+    do_handshake(&mut client_read, &mut client_write).await;
+
+    // 1. Open the document.
+    let open_notif = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": url.to_string(),
+                "languageId": "rust",
+                "version": 1,
+                "text": src
+            }
+        }
+    });
+    client_write
+        .write_all(&lsp_frame(&open_notif))
+        .await
+        .expect("write didOpen");
+
+    // 2. Wait for publishDiagnostics so the server has fully processed the file.
+    read_until(&mut client_read, Duration::from_secs(10), |frame| {
+        if frame.get("method")
+            == Some(&serde_json::Value::String(
+                "textDocument/publishDiagnostics".into(),
+            ))
+        {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("publishDiagnostics should arrive before executeCommand");
+
+    // 3. Send workspace/executeCommand (id=4).
+    let exec_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "workspace/executeCommand",
+        "params": {
+            "command": "splitrs.split",
+            "arguments": [{ "uri": url.to_string() }]
+        }
+    });
+    client_write
+        .write_all(&lsp_frame(&exec_req))
+        .await
+        .expect("write executeCommand request");
+
+    // 4. The server emits workspace/applyEdit BEFORE the executeCommand response.
+    //    Handle it and collect the WorkspaceEdit.
+    let edit_json =
+        handle_apply_edit_request(&mut client_read, &mut client_write, Duration::from_secs(10))
+            .await
+            .expect("workspace/applyEdit request should arrive within 10 s");
+
+    // 5. Assert the edit contains document_changes with at least 2 operations
+    //    (minimum: one Create + one TextDocumentEdit).
+    let doc_changes = &edit_json["documentChanges"];
+    let ops = doc_changes
+        .as_array()
+        .expect("documentChanges should be a JSON array");
+    assert!(
+        ops.len() >= 2,
+        "Expected at least 2 document_changes operations, got {}",
+        ops.len()
+    );
+
+    // Verify at least one Create operation is present.
+    let has_create = ops
+        .iter()
+        .any(|op| op.get("kind").and_then(|k| k.as_str()) == Some("create"));
+    assert!(
+        has_create,
+        "Expected at least one Create operation in document_changes"
+    );
+
+    // 6. Drain the executeCommand response (id=4, result: null).
+    let exec_result = read_until(&mut client_read, Duration::from_secs(10), |frame| {
+        if frame.get("id") == Some(&serde_json::json!(4)) {
+            Some(frame["result"].clone())
+        } else {
+            None
+        }
+    })
+    .await
+    .expect("executeCommand response should arrive within 10 s");
+
+    assert!(
+        exec_result.is_null(),
+        "executeCommand result should be null, got: {exec_result}"
+    );
+
+    server_handle.abort();
+}
+
 /// Test 4: A small file (well under the default 1000-line limit) produces an
 /// empty `publishDiagnostics` notification.
 #[tokio::test]

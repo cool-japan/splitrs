@@ -21,3 +21,5 @@ Cargo.lock
 
 # Rustc ICE dumps
 rustc-ice-*.txt
+
+target

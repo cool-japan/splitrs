@@ -106,11 +106,17 @@ splitrs --input src/large_file.rs --output src/large_file/
 
 ### LSP Integration (Editor Support)
 
-`splitrs-lsp` is included when you `cargo install splitrs` (LSP is a default feature).
+`splitrs-lsp` is included when you `cargo install splitrs` (LSP is a default feature). It speaks the Language Server Protocol over stdio and provides:
 
-Add to your editor's LSP config:
+- 🔴 **Diagnostics** when files exceed your `.splitrs.toml` `max_lines` limit (`source: "splitrs"`, severity: Information)
+- ⚡ **Code action** `Refactor with splitrs` to split large files directly from your editor
+- ℹ️  **Hover** at the top of any Rust file showing metrics (lines of code, method count, avg complexity)
 
-**Neovim (nvim-lspconfig):**
+---
+
+#### Zero-config quickstart
+
+**Neovim (via `vim.lsp.start`):**
 ```lua
 require('lspconfig').splitrs_lsp.setup{}
 -- Or manually:
@@ -127,12 +133,104 @@ language-servers = ["rust-analyzer", "splitrs-lsp"]
 command = "splitrs-lsp"
 ```
 
-The LSP server provides:
-- 🔴 Diagnostics when files exceed your `.splitrs.toml` `max_lines` limit
-- ⚡ Code action `Refactor with splitrs` to split directly from your editor
-- ℹ️ Hover at line 1 showing file metrics
+---
 
-To use LSP-only build without the full CLI:
+#### Rich editor plugins (in `editors/`)
+
+For a full-featured experience (config-watch, `:SplitrsRefactor` command, settings UI), use the plugins in the `editors/` directory:
+
+**Neovim — `editors/nvim/`**
+
+Full Lua plugin with `setup{}` API, `.splitrs.toml` watcher, and `:SplitrsRefactor` command:
+
+```lua
+-- With lazy.nvim (from a local checkout):
+{ dir = '/path/to/splitrs/editors/nvim', config = true }
+
+-- Manual setup:
+vim.opt.rtp:prepend('/path/to/splitrs/editors/nvim')
+require('splitrs').setup()
+
+-- Custom options:
+require('splitrs').setup({
+  cmd = { '/usr/local/bin/splitrs-lsp' },  -- custom binary path
+  enabled = true,
+})
+```
+
+**VSCode — `editors/vscode/`**
+
+TypeScript extension activating on `onLanguage:rust`. Sideload:
+
+```bash
+cd editors/vscode
+npm install
+npx vsce package          # creates splitrs-*.vsix
+code --install-extension splitrs-*.vsix
+```
+
+Configure via `settings.json`:
+```json
+{
+  "splitrs.serverPath": "splitrs-lsp",
+  "splitrs.enable": true,
+  "splitrs.trace.server": "off"
+}
+```
+
+Use the Command Palette (`Ctrl+Shift+P`) → `splitrs: Refactor current file`.
+
+**Emacs — `editors/emacs/`**
+
+Supports both built-in `eglot` (Emacs 29.1+) and `lsp-mode`:
+
+```elisp
+;; With use-package:
+(use-package splitrs
+  :load-path "path/to/splitrs/editors/emacs"
+  :hook ((rust-mode . splitrs-mode)
+         (rust-ts-mode . splitrs-mode)))
+
+;; Manual:
+(add-to-list 'load-path "path/to/splitrs/editors/emacs")
+(require 'splitrs)
+(splitrs-setup)  ; registers with eglot and lsp-mode
+
+;; Refactor from a Rust buffer:
+;; M-x splitrs-refactor-current-file
+```
+
+splitrs-lsp runs **alongside** rust-analyzer — it uses `:add-on? t` in lsp-mode and appends to `eglot-server-programs` so neither server displaces the other.
+
+**IntelliJ IDEA — `editors/intellij/`**
+
+Kotlin/Gradle plugin using IntelliJ 2024.2+'s built-in LSP API. Build:
+
+```bash
+cd editors/intellij
+gradle wrapper --gradle-version 8.10   # one-time setup
+./gradlew buildPlugin
+# Install: Settings → Plugins → Install Plugin from Disk → build/distributions/*.zip
+```
+
+Requires: IntelliJ IDEA 2024.2 or later, JDK 21, `splitrs-lsp` on `$PATH`.
+
+---
+
+#### Configuration (all editors)
+
+Create `.splitrs.toml` in your project root to customise the server:
+
+```toml
+[splitrs]
+max_lines = 1000       # warn when a file exceeds this many lines
+max_impl_lines = 300   # warn on oversized impl blocks (if split_impl_blocks = true)
+split_impl_blocks = true
+```
+
+The server hot-reloads `.splitrs.toml` whenever the file changes.
+
+To use LSP-only (without the full splitrs CLI):
 ```bash
 cargo install splitrs --no-default-features --features lsp
 ```
@@ -347,6 +445,56 @@ When using a `.splitrs.toml` file, you can configure:
 
 Command-line arguments always override configuration file settings.
 
+## 🔬 SMT-verified refactoring (experimental — `--features smt`)
+
+SplitRS can *prove* certain refactorings preserve semantics before applying
+them, using [OxiZ](https://github.com/cool-japan/oxiz) — a Pure-Rust SMT solver
+— as the verification backend. This is **off by default**; build it in with:
+
+```bash
+cargo build --features smt
+cargo run --features smt -- <args>
+```
+
+Three capabilities are exposed:
+
+**`--verify-equiv --left FILE::FN --right FILE::FN`** — prove two pure
+fixed-width-integer functions compute the same result for *all* inputs, or get a
+concrete counterexample:
+
+```bash
+# Proves `a` and `b` are equivalent (QF_BV, all inputs)
+splitrs --features smt --verify-equiv --left calc.rs::a --right calc.rs::b
+```
+
+**`--extract-pure`** — an SMT-verified pre-pass that runs *before* the split. It
+scans every over-budget free function for a pure-integer sub-run, factors it
+into a helper, and **commits the rewrite only when the solver proves it
+equivalent** to the original. Committed helpers are ordinary functions that then
+flow through the normal split/write pipeline. Non-equivalent or out-of-fragment
+candidates are skipped (with a reason) and the original is left untouched.
+
+**`--verify`** — emit an honest *Semantic verification report* that separates
+what was **proven** from what is merely **assumed**:
+
+- Each `--extract-pure` body rewrite that committed → *SMT-Verified equivalent
+  (QF_BV, all inputs)*.
+- The default whole-item module moves → *structural identity*: a byte-identical
+  relocation. SplitRS does **not** claim to SMT-prove move safety;
+  name-resolution and visibility correctness is the Rust compiler's job — verify
+  with `cargo check`.
+
+```bash
+splitrs --features smt -i big.rs -o out/ --extract-pure --verify
+```
+
+**Soundness boundary.** The proven fragment is *pure, fixed-width integers only*:
+`+ - * & | ^ << >>`, comparisons, `if`/`else`, `let`, and integer casts.
+Anything outside it — division/remainder, function calls, references, loops,
+floats — is reported as **Unsupported** and never committed (the gate refuses to
+rubber-stamp it). Whole-item relocations remain *structural identity*, not
+SMT-proven.
+
 ## 🏗️ How It Works
 
 SplitRS uses a multi-stage analysis pipeline:
@@ -396,7 +544,7 @@ Tested on real-world codebases:
 
 ## 🧪 Testing
 
-SplitRS includes **269 comprehensive tests** covering all analysis components:
+SplitRS includes **450 comprehensive tests** covering all analysis components:
 
 ```bash
 # Run all tests (recommended)
@@ -513,7 +661,16 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.1 - Latest)
+### Implemented Features (v0.3.2 - Latest)
+
+**v0.3.2 Highlights (2026-06-09):**
+- ✅ SMT-verified function extraction (`--features smt --extract-pure`): extracts pure integer sub-blocks from over-budget free functions, committing only when OxiZ proves semantic equivalence
+- ✅ SMT equivalence oracle (`splitrs smt-verify-equiv`): standalone equivalence checker between two Rust functions using QF_BV theory
+- ✅ Array-splitting mode (`--split-arrays`): splits oversized `static`/`const` array literals across chunk files with `const fn` compile-time reconstruction
+- ✅ Test-module splitter (`--split-test-modules`): splits multiple `#[cfg(test)]` blocks into per-module `tests_NAME.rs` files
+- ✅ Editor integrations shipped in `editors/`: Emacs, IntelliJ, Neovim, VSCode
+- ✅ `module_generator` refactored into `src/module_generator/` (3 modules, all under 2000 lines)
+- ✅ Test suite: 450 tests passing (was 269 in v0.3.1)
 
 **v0.3.1 Highlights:**
 - ✅ LSP Integration (`splitrs-lsp` binary, tower-lsp, diagnostics, code actions, hover, config watch)
@@ -549,7 +706,7 @@ cargo test
 
 **Next features (v0.4.0+):**
 - Macro expansion support (full `cargo expand` integration)
-- Editor plugins (VS Code extension, IntelliJ plugin)
+- Extended SMT fragment: division, loops, references
 
 **Future enhancements (v0.5.0+):**
 - Cross-language support exploration

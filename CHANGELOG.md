@@ -5,6 +5,46 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-06-09
+
+### Added
+- **SMT-verified function extraction** (new `smt` feature, off by default; `src/extraction/` module):
+  - `extraction::extract_pure_blocks()` — extracts pure fixed-width-integer sub-blocks from over-budget free functions, committing the extraction only when the OxiZ SMT solver proves semantic equivalence is preserved
+  - `ExtractionOutcome` enum: `Committed`, `SkippedRefuted` (safety net — rewriter bug caught via counterexample), `SkippedUnsupported`
+  - Internal pipeline: `detector::find_candidate` (live-variable analysis) → `rewriter::rewrite` (helper synthesis) → `gate::verify_and_decide` (QF_BV proof with whole-function inline-back and componentwise fallback)
+  - `dataflow.rs` — live-variable dataflow analysis driving the extraction detector
+- **SMT equivalence oracle** (`src/smt/` module, feature-gated `smt`):
+  - `EquivBuilder` — proves two pure fixed-width-integer Rust functions equivalent for all inputs using QF_BV theory via the OxiZ solver; returns `Verified`, `Refuted(Counterexample)`, or `Unsupported`
+  - `is_pure_supported_expr()` / `is_pure_supported_block()` — non-mutating purity probes with no SMT overhead
+  - `IntType` and `int_type_of()` — integer-type inference for SMT encoding
+- **`splitrs smt-verify-equiv` CLI subcommand** (`src/smt_cli.rs`) — standalone equivalence checker between two Rust function sources
+- **Array-splitting mode** (`src/array_splitter.rs`):
+  - Splits oversized `static`/`const` array literals (data tables) across multiple chunk files using element-level partitioning
+  - Reconstructs the original `pub static NAME: &[T]` in `mod.rs` via a `const fn` compile-time concatenation (`T: Copy`; type-agnostic, no synthetic default required)
+  - `analyse_arrays()`, `ArrayItem`, `ArrayAnalysis` public API
+- **Test-module splitter** (`src/test_module_splitter.rs`):
+  - Splits multiple `#[cfg(test)]` / `#[cfg(all(test, ...))]` top-level mod blocks into per-module `tests_NAME.rs` files
+  - Falls back to classic single `tests.rs` extraction when only one test module is present
+- **Editor integrations** (`editors/`):
+  - Emacs: `splitrs.el` — LSP client configuration with ERT test suite
+  - IntelliJ: Kotlin plugin (`SplitrsLspServerDescriptor` / `SplitrsLspServerSupportProvider`) with Gradle build
+  - Neovim: Lua plugin (`lua/splitrs/init.lua`) with nvim-lspconfig-style setup and Busted spec
+  - VS Code: TypeScript extension (`src/extension.ts`) with `vscode-languageclient` and test suite
+- **Config module** (`src/config.rs`): structured `.splitrs.toml` support with `SplitRsConfig`, `NamingConfig`, `OutputConfig`, and `[[target_modules]]` routing rules
+- **Helper dependency tracker** (`src/helper_dependency_tracker.rs`) — tracks inter-helper dependencies for smarter module co-location
+- New integration test suites: `cross_module_visibility_tests`, `doc_comment_preservation_tests`, `extract_and_target_tests`, `extract_pure_cli_tests`, `extraction_e2e_tests`, `lsp_integration`, `semantic_naming_tests`, `smt_encoder_tests`, `smt_verify_equiv_cli_tests`, `standalone_extraction_tests`, `trait_impl_grouping_tests`
+
+### Changed
+- `FileAnalyzer` substantially extended with per-type trait-impl grouping and semantic module naming heuristics
+- `module_generator` expanded: per-type `<type>_traits.rs` modules replace the legacy shared `trait_impls.rs`; semantic naming for constants/macros/type-alias buckets
+- CLI (`main.rs`) extended with new subcommands, `--smt-verify`, array-split, and test-split flags
+- `examples/large_struct.rs`: poisoned-mutex `unwrap()` replaced with `unwrap_or_else(|e| e.into_inner())` (no-unwrap policy)
+
+### Dependencies
+- New optional (behind `smt` feature, off by default):
+  - `oxiz = "0.2.3"` (COOLJAPAN OxiZ SMT solver)
+  - `num-bigint = "0.4"` (fixed-width integer arithmetic for equivalence proofs)
+
 ## [0.3.1] - 2026-04-25
 
 ### Added

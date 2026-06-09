@@ -381,17 +381,29 @@ Provide ready-to-use CI/CD configurations:
 
 ### 19. Editor Plugins
 **Estimated effort:** 20-30 hours per editor
-**Status:** Research
+**Status:** ✅ IMPLEMENTED (v0.3.2)
 
 - VS Code extension
 - IntelliJ IDEA plugin
 - Vim/Neovim plugin
 - Emacs package
 
-- [ ] VSCode extension (TypeScript) consuming splitrs-lsp
-- [ ] IntelliJ plugin (Kotlin) consuming splitrs-lsp
-- [ ] Vim/Neovim plugin (Lua) auto-attaching splitrs-lsp
-- [ ] Emacs package (Elisp) auto-attaching splitrs-lsp
+- [x] VSCode extension (TypeScript) consuming splitrs-lsp (planned 2026-05-18)
+  - **Goal:** `editors/vscode/` extension — LanguageClient wiring `splitrs-lsp` over stdio, `**/.splitrs.toml` file watcher, `splitrs.refactorCurrentFile` palette command invoking `splitrs.split`, settings for `serverPath`/`enable`/`trace.server`.
+  - **Files:** `editors/vscode/package.json`, `editors/vscode/tsconfig.json`, `editors/vscode/src/extension.ts`, `editors/vscode/.vscodeignore`, `editors/vscode/.gitignore`
+  - **Tests:** `tsc --noEmit` strict mode; fallback JSON-schema sanity check if npm unavailable.
+- [x] IntelliJ plugin (Kotlin) consuming splitrs-lsp (planned 2026-05-18)
+  - **Goal:** `editors/intellij/` minimal scaffold using IntelliJ 2024.2+ LSP API (`LspServerSupportProvider` + `ProjectWideLspServerDescriptor`) — auto-attaches `splitrs-lsp` to `*.rs` files. Gradle 8.10+, JDK 21, `org.jetbrains.intellij.platform` 2.1.0.
+  - **Files:** `editors/intellij/build.gradle.kts`, `editors/intellij/settings.gradle.kts`, `editors/intellij/gradle.properties`, `editors/intellij/src/main/resources/META-INF/plugin.xml`, Kotlin sources, `PluginXmlTest.kt`, `.gitignore`
+  - **Tests:** `./gradlew test` (plain JUnit 5 XML parse); fallback `xmllint --xpath` if Gradle/JDK unavailable.
+- [x] Vim/Neovim plugin (Lua) auto-attaching splitrs-lsp (planned 2026-05-18)
+  - **Goal:** `editors/nvim/` Lua plugin — `setup{}` API, auto-attach on `FileType rust`, `.splitrs.toml` watcher, `:SplitrsRefactor` command, Vimscript bootstrap for plugin managers.
+  - **Files:** `editors/nvim/lua/splitrs/init.lua`, `editors/nvim/plugin/splitrs.vim`, `editors/nvim/test/splitrs_spec.lua`
+  - **Tests:** `nvim --headless -l test/splitrs_spec.lua`; fallback `luac -p` syntax check.
+- [x] Emacs package (Elisp) auto-attaching splitrs-lsp (planned 2026-05-18)
+  - **Goal:** `editors/emacs/splitrs.el` — eglot + lsp-mode dual support (`:add-on? t`), `splitrs-refactor-current-file` interactive command, customization group, Commentary as primary docs. Emacs 29.1+ required.
+  - **Files:** `editors/emacs/splitrs.el`, `editors/emacs/test/splitrs-test.el`
+  - **Tests:** `emacs --batch -f ert-run-tests-batch-and-exit`; fallback byte-compile check.
 
 ---
 
@@ -427,6 +439,31 @@ Generate HTML report with metrics:
 - [x] Generated code could be more idiomatic in some cases (FIXED v0.2.1 - enhanced error messages)
 - [x] Module naming could be smarter for domain-specific patterns (FIXED v0.2.1 - domain-specific naming)
 - [x] Performance optimization for files >5000 lines (FIXED v0.2.1 - benchmarking suite added)
+
+---
+
+## Pending follow-ups (2026-05-18, /ultra run)
+
+- [x] splitrs-lsp end-to-end smoke test (codeAction → executeCommand → workspace/applyEdit round-trip) (planned 2026-05-18)
+  - **Goal:** Two new in-process tests in `tests/lsp_integration.rs` covering the codeAction → executeCommand → workspace/applyEdit round-trip — the path every editor plugin depends on.
+  - **Files:** `tests/lsp_integration.rs`
+  - **Tests:** `test_code_action_for_oversize_diagnostic`, `test_execute_command_splits_file_via_apply_edit`
+- [x] Semantic naming for batched impls (replace `<type>_impl_N.rs` with `<type>_<purpose>.rs`) (planned 2026-05-18)
+  - **Goal:** Use `MethodGroup::suggest_name()` for batched impl files; fall back to numeric suffix on collision or unstructured methods.
+  - **Files:** `src/file_analyzer.rs`
+  - **Tests:** `tests/semantic_naming_tests.rs` (4 cases)
+- [x] Per-type trait-impl grouping (replace shared `trait_impls.rs` with `<type>_traits.rs`) (planned 2026-05-18)
+  - **Goal:** Each type's trait impls go to its own `<type>_traits.rs`; batch within type if over budget.
+  - **Files:** `src/file_analyzer.rs`, possibly `src/module_generator.rs`
+  - **Tests:** `tests/trait_impl_grouping_tests.rs` (3 cases)
+- [x] Const/Static/Macro/TypeAlias extraction (route out of catch-all `functions.rs`) (planned 2026-05-18)
+  - **Goal:** Partition `standalone_items` by variant; route `Item::Const`/`Item::Static`/`Item::Macro`/`Item::Type` to dedicated modules.
+  - **Files:** `src/file_analyzer.rs`, `src/module_generator.rs`
+  - **Tests:** `tests/standalone_extraction_tests.rs` (5 cases)
+- [x] Doc-comment preservation between items (populate `TypeInfo.doc_comments`) (planned 2026-05-18)
+  - **Goal:** Capture file-level `//!` blocks and section-header `///` comments; render at the top of per-type modules and `mod.rs`.
+  - **Files:** `src/file_analyzer.rs`, `src/module_generator.rs`
+  - **Tests:** `tests/doc_comment_preservation_tests.rs` (3 cases)
 
 ---
 
@@ -536,6 +573,18 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Deduplicated `std::collections` import handling across split modules (commit 288228f)
 - ✅ Test suite: 269 tests passing
 
+### v0.3.2 (Released 2026-06-09)
+- ✅ SMT-verified function extraction (`src/extraction/` module, `smt` feature)
+- ✅ SMT equivalence oracle (`src/smt/`, `EquivBuilder`, `Verdict`, `Counterexample`)
+- ✅ `splitrs smt-verify-equiv` CLI subcommand (`src/smt_cli.rs`)
+- ✅ Array-splitting mode (`src/array_splitter.rs`, `--split-arrays`)
+- ✅ Test-module splitter (`src/test_module_splitter.rs`, `--split-test-modules`)
+- ✅ Editor integrations: Emacs (`editors/emacs/`), IntelliJ (`editors/intellij/`), Neovim (`editors/nvim/`), VSCode (`editors/vscode/`)
+- ✅ `module_generator` refactored from single 2745-line file into `src/module_generator/` (types.rs 1165L, functions.rs 1029L, refvisitor_traits.rs 67L)
+- ✅ New optional feature flag: `smt = ["dep:oxiz", "dep:num-bigint"]`
+- ✅ Test suite: 450 tests passing (was 269 in v0.3.1)
+- ✅ Codebase: 19,685 lines of Rust across 63 files
+
 ### v1.0.0 (Production Ready)
 - All critical features implemented
 - Comprehensive documentation
@@ -545,5 +594,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-06-09
 **Maintainers:** COOLJAPAN OU (Team KitaSan)
