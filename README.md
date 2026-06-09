@@ -661,7 +661,7 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.2 - Latest)
+### Implemented Features (v0.3.2 — Latest Release)
 
 **v0.3.2 Highlights (2026-06-09):**
 - ✅ SMT-verified function extraction (`--features smt --extract-pure`): extracts pure integer sub-blocks from over-budget free functions, committing only when OxiZ proves semantic equivalence

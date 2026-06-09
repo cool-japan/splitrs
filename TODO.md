@@ -585,6 +585,9 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Test suite: 450 tests passing (was 269 in v0.3.1)
 - ✅ Codebase: 19,685 lines of Rust across 63 files
 
+### v0.3.3 (Unreleased)
+- 🔲 TBD
+
 ### v1.0.0 (Production Ready)
 - All critical features implemented
 - Comprehensive documentation
