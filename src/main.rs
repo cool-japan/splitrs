@@ -71,6 +71,7 @@ mod metrics_dashboard;
 mod module_generator;
 mod naming_strategy;
 mod scope_analyzer;
+mod source_map;
 mod test_generator;
 
 // The SMT oracle and its CLI live in the library crate; the binary consumes
@@ -621,6 +622,7 @@ fn main() -> Result<()> {
     );
     analyzer.set_extract_tests(config.splitrs.extract_tests);
     analyzer.set_target_modules(config.target_modules.clone());
+    analyzer.set_source(&source_code);
     analyzer.analyze_with_test_files(&syntax_tree, input);
 
     println!("Found {} types", analyzer.types.len());
@@ -1352,6 +1354,7 @@ fn process_workspace_file(
 
     // Analyze the file (including any referenced test files)
     let mut analyzer = FileAnalyzer::new(true, max_lines / 2);
+    analyzer.set_source(&source_code);
     analyzer.analyze_with_test_files(&syntax_tree, input);
 
     // Group into modules

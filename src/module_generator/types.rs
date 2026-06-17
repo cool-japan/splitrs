@@ -33,6 +33,11 @@ pub struct Module {
     pub types: Vec<TypeInfo>,
     /// Standalone items (functions, constants, etc.)
     pub standalone_items: Vec<Item>,
+    /// Byte-faithful verbatim source text for each entry in `standalone_items`,
+    /// index-aligned (`standalone_verbatim[i]` corresponds to `standalone_items[i]`).
+    /// `None` for an item means no faithful slice is available (no source, or an
+    /// exotic routing site) and emission must fall back to prettyplease for it.
+    pub standalone_verbatim: Vec<Option<String>>,
     /// Type name for impl block splitting
     ///
     /// When this module contains split impl block methods, this field
@@ -52,6 +57,11 @@ pub struct Module {
     ///
     /// Preserves attributes like `#[cfg]`, `#[allow]`, etc. from the original impl block.
     pub impl_attrs: Vec<syn::Attribute>,
+    /// Byte-faithful verbatim text of the original `impl ... {` header line for
+    /// split-impl modules (preserves attributes/formatting). When present and all
+    /// methods carry `verbatim`, the impl block is emitted verbatim; otherwise
+    /// emission falls back to prettyplease.
+    pub impl_header_verbatim: Option<String>,
     /// Method group for split impl blocks
     ///
     /// When this module contains split impl block methods, this field
@@ -85,10 +95,12 @@ impl Module {
             name,
             types: Vec::new(),
             standalone_items: Vec::new(),
+            standalone_verbatim: Vec::new(),
             impl_type_name: None,
             impl_self_ty: None,
             impl_generics: None,
             impl_attrs: Vec::new(),
+            impl_header_verbatim: None,
             method_group: None,
             field_visibility: None,
             type_name_for_traits: None,
@@ -981,6 +993,11 @@ impl Module {
         }
         if let Some(_type_name) = &self.type_name_for_traits {
             for trait_impl in &self.trait_impls {
+                if let Some(verbatim) = &trait_impl.verbatim {
+                    content.push_str(verbatim);
+                    content.push('\n');
+                    continue;
+                }
                 let formatted = prettyplease::unparse(&syn::File {
                     shebang: None,
                     attrs: Vec::new(),
@@ -1029,6 +1046,31 @@ impl Module {
         }
         if let Some(method_group) = &self.method_group {
             if let Some(type_name) = &self.impl_type_name {
+                // Prefer byte-faithful verbatim emission: the original `impl ... {`
+                // header + each method's exact source (inline `//` comments and
+                // formatting preserved), then a closing `}`. Fall back to the
+                // prettyplease rendering when any verbatim slice is unavailable,
+                // so output is never empty/broken.
+                let all_verbatim: Option<Vec<&str>> = method_group
+                    .methods
+                    .iter()
+                    .map(|m| m.verbatim.as_deref())
+                    .collect();
+                if let (Some(header), Some(bodies)) =
+                    (self.impl_header_verbatim.as_deref(), all_verbatim)
+                {
+                    content.push_str(header);
+                    content.push('\n');
+                    for body in bodies {
+                        content.push_str(body);
+                        // Methods are separated by a blank line for readability;
+                        // each `body` is the verbatim method (no trailing newline).
+                        content.push_str("\n\n");
+                    }
+                    content.push_str("}\n");
+                    return content;
+                }
+                // Fallback: synthesize and pretty-print (original behavior).
                 let mut impl_items = Vec::new();
                 for method in &method_group.methods {
                     impl_items.push(syn::ImplItem::Fn(method.item.clone()));
@@ -1124,11 +1166,7 @@ impl Module {
             );
             items.extend(type_info.trait_impls.iter().map(|ti| ti.impl_item.clone()));
         }
-        for item in &self.standalone_items {
-            let upgraded_item = upgrade_function_visibility(item.clone(), needs_pub_super);
-            let upgraded_item = upgrade_type_visibility(upgraded_item);
-            items.push(upgraded_item);
-        }
+        // Bulk type-derived items keep their existing prettyplease rendering.
         if !items.is_empty() {
             let formatted = prettyplease::unparse(&syn::File {
                 shebang: None,
@@ -1136,6 +1174,39 @@ impl Module {
                 items,
             });
             content.push_str(&formatted);
+        }
+        // Standalone items: emit byte-verbatim from original source when the
+        // visibility upgrade is a no-op (so the original bytes are faithful) and
+        // an aligned source slice exists; otherwise fall back to prettyplease for
+        // that single item, preserving the visibility-widening behavior.
+        let verbs_aligned = self.standalone_verbatim.len() == self.standalone_items.len();
+        debug_assert!(
+            verbs_aligned || self.standalone_verbatim.is_empty(),
+            "standalone_verbatim must be index-aligned with standalone_items"
+        );
+        for (idx, item) in self.standalone_items.iter().enumerate() {
+            let upgraded = upgrade_type_visibility(upgrade_function_visibility(
+                item.clone(),
+                needs_pub_super,
+            ));
+            let vis_unchanged =
+                render_vis(item_visibility(item)) == render_vis(item_visibility(&upgraded));
+            let verbatim = if verbs_aligned && vis_unchanged {
+                self.standalone_verbatim[idx].as_deref()
+            } else {
+                None
+            };
+            if let Some(text) = verbatim {
+                content.push_str(text);
+                content.push_str("\n\n");
+            } else {
+                let formatted = prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![upgraded],
+                });
+                content.push_str(&formatted);
+            }
         }
         content
     }
@@ -1162,4 +1233,11 @@ pub(crate) struct RefVisitor {
     pub(crate) path_roots: HashSet<String>,
     pub(crate) method_calls: HashSet<String>,
     pub(crate) attr_idents: HashSet<String>,
+}
+
+/// Render an optional visibility to a stable string for no-op comparison.
+/// `Inherited` (None or empty) renders empty; `pub(super)` renders non-empty,
+/// so a private→`pub(super)` upgrade is detected as a change.
+fn render_vis(opt: Option<&syn::Visibility>) -> String {
+    opt.map(|v| quote::quote!(#v).to_string()).unwrap_or_default()
 }

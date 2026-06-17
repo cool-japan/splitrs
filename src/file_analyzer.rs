@@ -50,6 +50,11 @@ pub struct TypeInfo {
     /// Each tuple contains the original impl block and the groups of methods
     /// it should be split into, as determined by dependency analysis.
     pub large_impls: Vec<(ItemImpl, Vec<MethodGroup>)>,
+
+    /// Byte-faithful verbatim source for this type definition (reserved for
+    /// future verbatim emission of standalone type items). `None` when source
+    /// was unavailable; emission then falls back to prettyplease.
+    pub verbatim: Option<String>,
 }
 
 /// Information about a trait implementation
@@ -64,6 +69,11 @@ pub struct TraitImplInfo {
     /// Whether this is an unsafe impl
     #[allow(dead_code)]
     pub is_unsafe: bool,
+
+    /// Byte-faithful verbatim source of this trait impl (preserves inline `//`
+    /// comments and formatting). When present it is emitted verbatim; otherwise
+    /// emission falls back to prettyplease.
+    pub verbatim: Option<String>,
 }
 
 /// Core analyzer that processes a Rust file and determines how to split it
@@ -124,6 +134,11 @@ pub struct FileAnalyzer {
     /// parsed `syn::File.attrs`. These are emitted at the top of `mod.rs`
     /// and the primary module file to preserve crate/module documentation.
     pub file_inner_docs: Vec<syn::Attribute>,
+
+    /// Original source text of the file under analysis. Set via [`Self::set_source`]
+    /// so split items/methods can be emitted byte-for-byte (verbatim) rather than
+    /// re-rendered, preserving inline `//` comments and original formatting.
+    source_code: Option<String>,
 }
 
 impl FileAnalyzer {
@@ -149,6 +164,7 @@ impl FileAnalyzer {
             extracted_tests: Vec::new(),
             target_modules: Vec::new(),
             file_inner_docs: Vec::new(),
+            source_code: None,
         }
     }
 
@@ -159,6 +175,24 @@ impl FileAnalyzer {
     /// `standalone_items`.
     pub fn set_extract_tests(&mut self, enabled: bool) {
         self.extract_tests = enabled;
+    }
+
+    /// Provide the original source text so verbatim (byte-faithful) emission of
+    /// split items is possible. When unset, emission falls back to prettyplease.
+    pub fn set_source(&mut self, src: &str) {
+        self.source_code = Some(src.to_string());
+    }
+
+    /// Compute the byte-faithful verbatim source slice for a standalone `item`,
+    /// including its leading attributes/doc comments and original indentation.
+    /// Returns `None` when no source is available (the verbatim path is then
+    /// skipped and emission falls back to prettyplease).
+    fn standalone_verbatim_for(&self, item: &syn::Item) -> Option<String> {
+        use syn::spanned::Spanned;
+        let src = self.source_code.as_deref()?;
+        let sm = crate::source_map::SourceMap::new(src);
+        sm.item_verbatim_with_indent(item.span(), item_attrs(item))
+            .map(|s| s.to_string())
     }
 
     /// Install target-module routing rules (Feature B).
@@ -183,6 +217,11 @@ impl FileAnalyzer {
     /// 1. Analyzes all types to build scope information
     /// 2. Processes each item to extract types, impls, and determine splitting strategy
     pub fn analyze(&mut self, file: &File) {
+        // Clone the source ONCE up front so verbatim slicing can read it inside
+        // the item loop without conflicting with the `&mut self.types` borrow
+        // (`type_info`) held across the `Item::Impl` arm. Clones at most one String.
+        let src_opt: Option<String> = self.source_code.clone();
+
         // Item #5: Capture file-level `//!` inner doc attributes
         self.file_inner_docs = file
             .attrs
@@ -223,6 +262,7 @@ impl FileAnalyzer {
                             trait_impls: Vec::new(),
                             doc_comments: Vec::new(),
                             large_impls: Vec::new(),
+                            verbatim: None,
                         },
                     );
                 }
@@ -237,6 +277,7 @@ impl FileAnalyzer {
                             trait_impls: Vec::new(),
                             doc_comments: Vec::new(),
                             large_impls: Vec::new(),
+                            verbatim: None,
                         },
                     );
                 }
@@ -246,10 +287,17 @@ impl FileAnalyzer {
                             // Check if this is a trait implementation
                             if let Some(trait_name) = Self::get_trait_name(i) {
                                 // This is a trait impl: `impl Trait for Type`
+                                let trait_verbatim = src_opt.as_deref().and_then(|src| {
+                                    use syn::spanned::Spanned;
+                                    crate::source_map::SourceMap::new(src)
+                                        .item_verbatim_with_indent(i.span(), &i.attrs)
+                                        .map(|s| s.to_string())
+                                });
                                 type_info.trait_impls.push(TraitImplInfo {
                                     trait_name,
                                     impl_item: item.clone(),
                                     is_unsafe: i.unsafety.is_some(),
+                                    verbatim: trait_verbatim,
                                 });
                                 continue;
                             }
@@ -259,7 +307,7 @@ impl FileAnalyzer {
                             if self.split_impl_blocks {
                                 // Analyze impl block to get accurate line count from methods
                                 let mut analyzer = ImplBlockAnalyzer::new();
-                                analyzer.analyze(i);
+                                analyzer.analyze(i, src_opt.as_deref());
                                 let impl_lines = analyzer.get_total_lines();
 
                                 if impl_lines > self.max_impl_lines
@@ -635,6 +683,14 @@ impl FileAnalyzer {
                     let mut batch_lines: usize = 0;
                     let base_impl_name = format!("{}_impl", type_info.name.to_lowercase());
 
+                    // Byte-faithful original `impl ... {` header for this block, so
+                    // verbatim method emission can be wrapped in the exact original
+                    // impl line. `self.source_code` is read immutably here alongside
+                    // the immutable `type_info` borrow — no conflict.
+                    let header_verbatim = self.source_code.as_deref().and_then(|src| {
+                        crate::source_map::SourceMap::new(src).impl_header_verbatim(impl_block)
+                    });
+
                     // Helper to emit one batched module
                     let emit_batch =
                         |batch: &[&MethodGroup],
@@ -668,6 +724,7 @@ impl FileAnalyzer {
                             module.impl_generics = Some(impl_block.generics.clone());
                             module.impl_attrs = impl_block.attrs.clone();
                             module.method_group = Some(combined);
+                            module.impl_header_verbatim = header_verbatim.clone();
                             modules.push(module);
                         };
 
@@ -695,6 +752,7 @@ impl FileAnalyzer {
                     trait_impls: vec![], // Trait impls go in separate module
                     doc_comments: type_info.doc_comments.clone(),
                     large_impls: vec![],
+                    verbatim: None,
                 });
                 modules.push(type_module);
             }
@@ -733,6 +791,7 @@ impl FileAnalyzer {
                 trait_impls: Vec::new(),
                 doc_comments: type_info.doc_comments.clone(),
                 large_impls: type_info.large_impls.clone(),
+                verbatim: None,
             });
             current_lines += type_lines;
         }
@@ -774,7 +833,8 @@ impl FileAnalyzer {
                                base_name: &str,
                                module_name_counts: &mut HashMap<String, usize>,
                                modules: &mut Vec<Module>,
-                               max_lines: usize| {
+                               max_lines: usize,
+                               verbatim_for: &dyn Fn(&Item) -> Option<String>| {
                 if bucket.is_empty() {
                     return;
                 }
@@ -795,6 +855,9 @@ impl FileAnalyzer {
                         current_lines = 0;
                     }
                     current_module.standalone_items.push((*item).clone());
+                    current_module
+                        .standalone_verbatim
+                        .push(verbatim_for(item));
                     current_lines += item_lines;
                 }
 
@@ -809,6 +872,7 @@ impl FileAnalyzer {
                 &mut module_name_counts,
                 &mut modules,
                 max_lines,
+                &|it| self.standalone_verbatim_for(it),
             );
             emit_bucket(
                 macros_items,
@@ -816,6 +880,7 @@ impl FileAnalyzer {
                 &mut module_name_counts,
                 &mut modules,
                 max_lines,
+                &|it| self.standalone_verbatim_for(it),
             );
             emit_bucket(
                 type_aliases,
@@ -823,6 +888,7 @@ impl FileAnalyzer {
                 &mut module_name_counts,
                 &mut modules,
                 max_lines,
+                &|it| self.standalone_verbatim_for(it),
             );
             emit_bucket(
                 functions,
@@ -830,6 +896,7 @@ impl FileAnalyzer {
                 &mut module_name_counts,
                 &mut modules,
                 max_lines,
+                &|it| self.standalone_verbatim_for(it),
             );
         }
 
@@ -896,6 +963,9 @@ impl FileAnalyzer {
             routing.modules[module_idx]
                 .standalone_items
                 .push(item.clone());
+            routing.modules[module_idx]
+                .standalone_verbatim
+                .push(self.standalone_verbatim_for(item));
             routing.routed_standalone_indices.insert(idx);
         }
 
@@ -1244,6 +1314,29 @@ impl TargetRouting {
                     || m.method_group.is_some()
             })
             .collect()
+    }
+}
+
+/// Borrow the attribute slice of any `syn::Item` kind that carries attributes.
+/// `syn::Item` is `#[non_exhaustive]`, so unknown/attr-less kinds yield `&[]`.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(x) => &x.attrs,
+        syn::Item::Enum(x) => &x.attrs,
+        syn::Item::ExternCrate(x) => &x.attrs,
+        syn::Item::Fn(x) => &x.attrs,
+        syn::Item::ForeignMod(x) => &x.attrs,
+        syn::Item::Impl(x) => &x.attrs,
+        syn::Item::Macro(x) => &x.attrs,
+        syn::Item::Mod(x) => &x.attrs,
+        syn::Item::Static(x) => &x.attrs,
+        syn::Item::Struct(x) => &x.attrs,
+        syn::Item::Trait(x) => &x.attrs,
+        syn::Item::TraitAlias(x) => &x.attrs,
+        syn::Item::Type(x) => &x.attrs,
+        syn::Item::Union(x) => &x.attrs,
+        syn::Item::Use(x) => &x.attrs,
+        _ => &[],
     }
 }
 

@@ -10,6 +10,7 @@ pub struct MethodInfo {
     pub item: ImplItemFn,
     pub calls_methods: HashSet<String>,
     pub line_count: usize,
+    pub verbatim: Option<String>,
 }
 
 /// Analyzer for impl blocks to detect method boundaries and dependencies
@@ -31,16 +32,16 @@ impl ImplBlockAnalyzer {
     }
 
     /// Analyze an impl block and extract method information
-    pub fn analyze(&mut self, impl_item: &ItemImpl) {
+    pub fn analyze(&mut self, impl_item: &ItemImpl, source: Option<&str>) {
         for item in &impl_item.items {
             if let ImplItem::Fn(method) = item {
-                let method_info = self.analyze_method(method);
+                let method_info = self.analyze_method(method, source);
                 self.methods.push(method_info);
             }
         }
     }
 
-    fn analyze_method(&self, method: &ImplItemFn) -> MethodInfo {
+    fn analyze_method(&self, method: &ImplItemFn, source: Option<&str>) -> MethodInfo {
         let name = method.sig.ident.to_string();
         let mut visitor = MethodCallVisitor::new();
         visitor.visit_impl_item_fn(method);
@@ -64,11 +65,19 @@ impl ImplBlockAnalyzer {
                 .max(1)
         };
 
+        let verbatim = source.and_then(|src| {
+            use syn::spanned::Spanned;
+            let sm = crate::source_map::SourceMap::new(src);
+            sm.item_verbatim_with_indent(method.span(), &method.attrs)
+                .map(|s| s.to_string())
+        });
+
         MethodInfo {
             name,
             item: method.clone(),
             calls_methods: visitor.called_methods,
             line_count,
+            verbatim,
         }
     }
 
@@ -381,7 +390,7 @@ mod tests {
         };
 
         let mut analyzer = ImplBlockAnalyzer::new();
-        analyzer.analyze(&impl_block);
+        analyzer.analyze(&impl_block, None);
 
         assert_eq!(analyzer.get_total_methods(), 3);
         assert!(analyzer.methods.iter().any(|m| m.name == "foo"));
@@ -408,7 +417,7 @@ mod tests {
         };
 
         let mut analyzer = ImplBlockAnalyzer::new();
-        analyzer.analyze(&impl_block);
+        analyzer.analyze(&impl_block, None);
 
         let groups = analyzer.group_methods(1000);
         assert!(!groups.is_empty());
@@ -465,6 +474,7 @@ mod tests {
             item: long_method,
             calls_methods: HashSet::new(),
             line_count: 30,
+            verbatim: None,
         });
 
         let suggested = group.suggest_name();
@@ -497,6 +507,7 @@ mod tests {
             item: method1,
             calls_methods: HashSet::new(),
             line_count: 20,
+            verbatim: None,
         });
 
         group.methods.push(MethodInfo {
@@ -504,6 +515,7 @@ mod tests {
             item: method2,
             calls_methods: HashSet::new(),
             line_count: 20,
+            verbatim: None,
         });
 
         assert_eq!(group.suggest_name(), "serialization");
@@ -522,6 +534,7 @@ mod tests {
                 item: method,
                 calls_methods: HashSet::new(),
                 line_count: 10,
+                verbatim: None,
             });
         }
 
@@ -541,6 +554,7 @@ mod tests {
                 item: method,
                 calls_methods: HashSet::new(),
                 line_count: 10,
+                verbatim: None,
             });
         }
 
@@ -560,6 +574,7 @@ mod tests {
             item: method,
             calls_methods: HashSet::new(),
             line_count: 10,
+            verbatim: None,
         });
 
         assert_eq!(group.suggest_name(), "builders");
@@ -578,6 +593,7 @@ mod tests {
                 item: method,
                 calls_methods: HashSet::new(),
                 line_count: 10,
+                verbatim: None,
             });
         }
 

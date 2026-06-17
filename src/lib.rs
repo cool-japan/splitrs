@@ -20,6 +20,7 @@ pub mod macro_analyzer;
 pub mod method_analyzer;
 pub mod module_generator;
 pub mod scope_analyzer;
+pub mod source_map;
 pub mod trait_method_tracker;
 
 // Re-export configuration and utility modules

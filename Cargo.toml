@@ -24,6 +24,7 @@ smt = ["dep:oxiz", "dep:num-bigint"]
 [dependencies]
 syn = { version = "2.0", features = ["full", "parsing", "printing", "visit"] }
 quote = "1.0"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 walkdir = "2.5"
