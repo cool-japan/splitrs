@@ -227,9 +227,7 @@ mod tests {
             "indentation not preserved: {with_indent:?}"
         );
         // The non-indent variant should NOT start with spaces.
-        let no_indent = sm
-            .item_verbatim(item.span(), &item.attrs)
-            .expect("slice");
+        let no_indent = sm.item_verbatim(item.span(), &item.attrs).expect("slice");
         assert!(no_indent.starts_with("pub fn f()"), "got: {no_indent:?}");
     }
 

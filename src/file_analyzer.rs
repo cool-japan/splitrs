@@ -829,42 +829,41 @@ impl FileAnalyzer {
 
             // Helper: emit one bucket into batched modules with the given base name.
             // Uses pick_unique_module_name for consistent `_2` / `_3` suffixing.
-            let emit_bucket = |bucket: Vec<&Item>,
-                               base_name: &str,
-                               module_name_counts: &mut HashMap<String, usize>,
-                               modules: &mut Vec<Module>,
-                               max_lines: usize,
-                               verbatim_for: &dyn Fn(&Item) -> Option<String>| {
-                if bucket.is_empty() {
-                    return;
-                }
-                // Pick the name for the first module in this bucket
-                let first_name = pick_unique_module_name(base_name, module_name_counts);
-                let mut current_module = Module::new(first_name);
-                let mut current_lines: usize = 0;
-
-                for item in bucket {
-                    let item_lines = estimate_item_lines(item);
-                    if current_lines + item_lines > max_lines
-                        && !current_module.standalone_items.is_empty()
-                    {
-                        // Flush current module and start a new one
-                        modules.push(current_module);
-                        let next_name = pick_unique_module_name(base_name, module_name_counts);
-                        current_module = Module::new(next_name);
-                        current_lines = 0;
+            let emit_bucket =
+                |bucket: Vec<&Item>,
+                 base_name: &str,
+                 module_name_counts: &mut HashMap<String, usize>,
+                 modules: &mut Vec<Module>,
+                 max_lines: usize,
+                 verbatim_for: &dyn Fn(&Item) -> Option<String>| {
+                    if bucket.is_empty() {
+                        return;
                     }
-                    current_module.standalone_items.push((*item).clone());
-                    current_module
-                        .standalone_verbatim
-                        .push(verbatim_for(item));
-                    current_lines += item_lines;
-                }
+                    // Pick the name for the first module in this bucket
+                    let first_name = pick_unique_module_name(base_name, module_name_counts);
+                    let mut current_module = Module::new(first_name);
+                    let mut current_lines: usize = 0;
 
-                if !current_module.standalone_items.is_empty() {
-                    modules.push(current_module);
-                }
-            };
+                    for item in bucket {
+                        let item_lines = estimate_item_lines(item);
+                        if current_lines + item_lines > max_lines
+                            && !current_module.standalone_items.is_empty()
+                        {
+                            // Flush current module and start a new one
+                            modules.push(current_module);
+                            let next_name = pick_unique_module_name(base_name, module_name_counts);
+                            current_module = Module::new(next_name);
+                            current_lines = 0;
+                        }
+                        current_module.standalone_items.push((*item).clone());
+                        current_module.standalone_verbatim.push(verbatim_for(item));
+                        current_lines += item_lines;
+                    }
+
+                    if !current_module.standalone_items.is_empty() {
+                        modules.push(current_module);
+                    }
+                };
 
             emit_bucket(
                 const_statics,

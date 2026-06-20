@@ -1185,10 +1185,8 @@ impl Module {
             "standalone_verbatim must be index-aligned with standalone_items"
         );
         for (idx, item) in self.standalone_items.iter().enumerate() {
-            let upgraded = upgrade_type_visibility(upgrade_function_visibility(
-                item.clone(),
-                needs_pub_super,
-            ));
+            let upgraded =
+                upgrade_type_visibility(upgrade_function_visibility(item.clone(), needs_pub_super));
             let vis_unchanged =
                 render_vis(item_visibility(item)) == render_vis(item_visibility(&upgraded));
             let verbatim = if verbs_aligned && vis_unchanged {
@@ -1239,5 +1237,6 @@ pub(crate) struct RefVisitor {
 /// `Inherited` (None or empty) renders empty; `pub(super)` renders non-empty,
 /// so a private→`pub(super)` upgrade is detected as a change.
 fn render_vis(opt: Option<&syn::Visibility>) -> String {
-    opt.map(|v| quote::quote!(#v).to_string()).unwrap_or_default()
+    opt.map(|v| quote::quote!(#v).to_string())
+        .unwrap_or_default()
 }
