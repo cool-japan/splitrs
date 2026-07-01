@@ -34,8 +34,8 @@ toml = "1.1"
 rayon = "1.12"
 serde_json = "1.0"
 tower-lsp = { version = "0.20.0", optional = true }
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync"], optional = true }
-dashmap = { version = "6.1.0", optional = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync"], optional = true }
+dashmap = { version = "6.2.1", optional = true }
 # SMT solver for verified refactoring — DEV: relative path (COOLJAPAN: no hardcoded absolute paths).
 oxiz = { version = "0.2.3", optional = true }
 num-bigint = { version = "0.4", optional = true }
@@ -43,7 +43,7 @@ num-bigint = { version = "0.4", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
 
 [lib]
 name = "splitrs"
