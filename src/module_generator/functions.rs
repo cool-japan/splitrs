@@ -35,7 +35,7 @@ pub(super) fn use_tree_is_pure_glob(use_item: &Item) -> bool {
 /// `use a::{B, C as D};` it is `B` and `D`. Glob leaves contribute nothing
 /// (their names are not statically known). Used to compute which referenced
 /// path-roots a module already resolves via explicit imports.
-pub(super) fn collect_use_bound_names(use_item: &Item, out: &mut HashSet<String>) {
+pub(crate) fn collect_use_bound_names(use_item: &Item, out: &mut HashSet<String>) {
     let Item::Use(u) = use_item else {
         return;
     };
@@ -321,6 +321,11 @@ pub(super) fn upgrade_function_visibility(item: Item, needs_pub_super: &HashSet<
 /// module — `mod.rs` glob-re-exports `pub` items only, so the type stays
 /// internal to the original file's module from the outside. Types that are
 /// already `pub` or have an explicit restricted visibility are left untouched.
+///
+/// Inline modules are covered too: a private `mod util { ... }` relocated into
+/// a generated bucket may be referenced from a sibling submodule or re-bound in
+/// the generated `mod.rs` (`use self::functions::util;`), which fails with
+/// `error[E0603]: module 'util' is private` unless the declaration is widened.
 pub(super) fn upgrade_type_visibility(item: Item) -> Item {
     fn bump(vis: &mut syn::Visibility) {
         if matches!(vis, syn::Visibility::Inherited) {
@@ -355,6 +360,10 @@ pub(super) fn upgrade_type_visibility(item: Item) -> Item {
         Item::Static(mut s) => {
             bump(&mut s.vis);
             Item::Static(s)
+        }
+        Item::Mod(mut m) => {
+            bump(&mut m.vis);
+            Item::Mod(m)
         }
         other => other,
     }

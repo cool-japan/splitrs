@@ -111,6 +111,93 @@ Then simply run:
 splitrs --input src/large_file.rs --output src/large_file/
 ```
 
+### Nested Inline-Mod Descent (v0.3.3)
+
+By default, an over-budget inline `mod x { ... }` block travels as one opaque
+item. With `--split-nested-mods true`, SplitRS descends into it and re-runs the
+full analyze → group → generate pipeline on the module body, recursively:
+
+```bash
+# Recursively split over-budget inline `mod x { ... }` blocks
+splitrs -i src/lib.rs -o src/lib_split/ --split-nested-mods true
+
+# Guard the recursion depth (modules nested deeper stay opaque; default: 8)
+splitrs -i src/lib.rs -o src/lib_split/ --split-nested-mods true --max-mod-depth 2
+
+# Control the re-export style of every generated mod.rs
+splitrs -i src/lib.rs -o src/lib_split/ --facade named
+```
+
+Each descended module becomes an `x/` directory (`x/mod.rs` plus per-topic
+files) and is declared in the parent `mod.rs` with its original visibility,
+attributes, and doc comments — never re-exported, so historical
+`crate::x::Item` paths keep resolving. `super::` paths inside moved items are
+deepened by one level per descent (including `pub(super)` →
+`pub(in super::super)`), and the original file-scope `use` bindings are
+recreated in the generated `mod.rs`. Composes with `--extract-tests`
+(a per-level `tests.rs`).
+
+`--facade <STYLE>` accepts:
+- `glob` (default) — `pub use module::*;` re-exports
+- `named` — explicit `pub use module::{Foo, bar};` lists (better rustdoc, no glob shadowing)
+- `none` — declarations only, for hand-curated re-exports
+
+### Domain Mapping with `--target-modules` (v0.3.3)
+
+Instead of the default `types.rs`/`functions.rs` heuristic, a TOML spec can
+route items into named domain modules — and, combined with
+`--split-nested-mods`, route them *inside* a descended module:
+
+```toml
+# domains.toml
+# How items not matched by any rule are assigned:
+#   "heuristic" (default) — classic types.rs/functions.rs buckets
+#   "seeded"              — pulled into the named module with the strongest
+#                           reference affinity (deterministic fixpoint)
+assign_unlisted = "seeded"
+
+[[target_modules]]
+name = "hash"
+parent = "core"              # route inside the core/ module descended by --split-nested-mods
+items = ["*hash*", "Sha*"]   # exact, prefix Foo*, suffix *Foo, infix *foo*, multi a*b*c, catch-all *
+pull_dependencies = true     # matched items drag their private helpers along
+doc = "Hashing and digest helpers."
+
+[[target_modules]]
+name = "compare"
+parent = "core"
+items = ["compare_*", "Diff*"]
+
+[[target_modules]]
+name = "config"
+items = ["Config", "SortBy"] # exact names matching nothing = hard error (with near-miss suggestions)
+max_lines = 400              # this module overflows into config_2.rs, config_3.rs, ...
+```
+
+```bash
+splitrs -i src/lib.rs -o src/lib_split/ \
+  --split-nested-mods true \
+  --target-modules domains.toml \
+  --dry-run    # attribution report: which rule (or seed edge) pulled each item
+```
+
+**Resulting layout** (impls and trait impls travel with their self type):
+
+```
+lib_split/
+├── mod.rs        # facade: `pub mod core;` — crate::core::Item paths preserved
+├── config.rs     # routed by exact name
+└── core/
+    ├── mod.rs
+    ├── hash.rs
+    └── compare.rs
+```
+
+Specs are validated up front: duplicate module names within the same `parent`
+scope, rules with an empty `items` list, catch-all `*` rules that are not last
+in their scope, and `parent = "..."` rules without `--split-nested-mods true`
+are all hard errors.
+
 ### LSP Integration (Editor Support)
 
 `splitrs-lsp` is included when you `cargo install splitrs` (LSP is a default feature). It speaks the Language Server Protocol over stdio and provides:
@@ -430,6 +517,10 @@ where
 | `--dry-run` | `-n` | Preview without creating files | false |
 | `--interactive` | `-I` | Prompt for confirmation before creating files | false |
 | `--config <FILE>` | `-c` | Path to configuration file | `.splitrs.toml` |
+| `--target-modules <TOML-FILE>` | | TOML file with `[[target_modules]]` routing rules for named splits | - |
+| `--split-nested-mods <BOOL>` | | Descend into over-budget inline `mod x { ... }` blocks recursively | false |
+| `--max-mod-depth <N>` | | Recursion depth guard for `--split-nested-mods` | 8 |
+| `--facade <STYLE>` | | Re-export style in each generated `mod.rs`: `glob`, `named`, `none` | glob |
 
 ### Configuration File Options
 
@@ -439,6 +530,8 @@ When using a `.splitrs.toml` file, you can configure:
 - `max_lines` - Maximum lines per module
 - `max_impl_lines` - Maximum lines per impl block
 - `split_impl_blocks` - Enable impl block splitting
+- `split_nested_mods` - Descend into over-budget inline `mod x { ... }` blocks (default: `false`)
+- `max_mod_depth` - Recursion depth guard for `split_nested_mods` (default: `8`)
 
 **`[naming]` section:**
 - `type_module_suffix` - Suffix for type modules (default: `"_type"`)
@@ -449,6 +542,7 @@ When using a `.splitrs.toml` file, you can configure:
 - `module_doc_template` - Template for module documentation
 - `preserve_comments` - Preserve original comments (default: `true`)
 - `format_output` - Format with prettyplease (default: `true`)
+- `facade` - `mod.rs` re-export style: `"glob"`, `"named"`, or `"none"` (default: `"glob"`)
 
 Command-line arguments always override configuration file settings.
 

@@ -950,7 +950,11 @@ fn main() -> Result<()> {
     let mut type_to_module: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for module in &modules {
-        for exported_type in module.get_exported_types() {
+        // NOT `get_exported_types`: `macro_rules!` names are not
+        // path-importable — emitting `use super::macros::name;` fails with
+        // E0432 and makes every invocation E0659-ambiguous next to the
+        // `#[macro_use]` declaration in mod.rs.
+        for exported_type in module.importable_exported_names() {
             type_to_module.insert(exported_type, module.name.clone());
         }
     }
@@ -973,13 +977,17 @@ fn main() -> Result<()> {
     // Feature C: descended mod bodies resolved names through the original
     // file scope (`use super::*;` chains, `super::name` paths). Recreate the
     // needed bindings in mod.rs and upgrade referenced private functions.
-    let scope_uses = nested_mod_splitter::compute_parent_scope_items(
+    let scope = nested_mod_splitter::compute_parent_scope_items(
         &nested_mods,
         &analyzer.use_statements,
         &modules,
         &mut needs_pub_super,
         args.deepen_super,
     );
+    // The descended modules reach those bindings only through their forwarded
+    // `use super::*;` globs — tell their emission which names keep them alive.
+    nested_mod_splitter::install_parent_scope_provisions(&mut nested_plans, &scope);
+    let scope_uses = scope.items;
     let needs_pub_super = needs_pub_super;
     if !needs_pub_super.is_empty() {
         println!(

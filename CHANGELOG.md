@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.4] - Unreleased
 
+### Fixed
+- **Nested-mod descent (`--split-nested-mods`)**: private inline `mod` items relocated into generated buckets are now widened to `pub(super)` (new `Item::Mod` arm in `upgrade_type_visibility`), fixing `E0603` against the `use self::<bucket>::<mod>;` re-binding in the generated `mod.rs`
+- **Parent-scope binding recreation**: the forwarded `use super::*;` glob is no longer dropped when an unresolved lowercase name (bare fn call) or a called method belongs to an item the parent scope provides — `compute_parent_scope_items` now returns provided names and trait methods (`ParentScopeItems`), and step 2 also binds private traits reached only via method calls; fixes `E0425`/`E0599` in descended module bodies
+- **`#[macro_use]`-first `mod.rs` ordering**: `macro_rules!` names are excluded from the type-to-module import map (`Module::importable_exported_names`), eliminating bogus `use super::macros::<name>;` imports (`E0432`) and the resulting `E0659` ambiguity with `#[macro_use]`-expanded macros
+
+### Changed
+- `collect_use_bound_names` (`src/module_generator/functions.rs`) widened from `pub(super)` to `pub(crate)` so `nested_mod_splitter` can enumerate the bindings a generated `mod.rs` recreates for its descended children
+- Parent-scope import pruning also subtracts names the nested body binds through its own non-`super` use trees, removing duplicated `unused_imports` warnings from emitted `mod.rs`; `super::`-path targets are never subtracted by local bindings
+- Tests: five regression tests added (one per review finding, plus a `rustc` compile probe on the main nested-mod e2e test); hardcoded `/tmp` path in a test replaced with `std::env::temp_dir()`; suite now 570 tests passing with `--all-features`
+
 ## [0.3.3] - 2026-07-06
 
 ### Added
