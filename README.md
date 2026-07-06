@@ -40,6 +40,13 @@ SplitRS uses AST-based analysis to automatically refactor large Rust source file
   - Hover showing file metrics (LoC, methods, complexity)
   - `.splitrs.toml` config watch with hot reload
 
+### v0.3.3 Features
+- 🗺️ **Domain-Mapping for `--target-modules`**: seeded assignment pulls unlisted items into the module with the strongest reference affinity, unknown-name validation with near-miss suggestions, dry-run attribution, and an extended schema (`parent`, `pull_dependencies`, `doc`, `max_lines`) plus infix/multi-segment glob patterns
+- 🌲 **Nested Inline-Mod Descent** (`--split-nested-mods`, `--max-mod-depth`): recursively splits over-budget inline `mod x { ... }` blocks through the same analyze → group → generate pipeline
+- 🎭 **Facade Style Control** (`--facade <glob|named|none>`): choose glob re-exports, explicit named re-exports, or declarations-only for generated `mod.rs` facades
+- ✂️ **Verbatim Method Extraction**: `SourceMap` now covers individual extracted impl methods, preserving original formatting byte-for-byte
+- 🧪 **New Integration Test Suites**: `acceptance_e2e_tests`, `domain_mapping_tests`, `nested_mod_tests`
+
 ## 📦 Installation
 
 ```bash
@@ -661,7 +668,17 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.2 — Latest Release)
+### Implemented Features (v0.3.3 — Latest Release)
+
+**v0.3.3 Highlights (2026-07-06):**
+- ✅ Domain-mapping for `--target-modules` (seeded assignment, unknown-name validation, dry-run attribution, extended schema: `parent`/`pull_dependencies`/`doc`/`max_lines`, infix/multi-segment glob patterns, `validate_target_modules()`)
+- ✅ Nested inline-mod descent (`--split-nested-mods`, `--max-mod-depth`): recursively splits over-budget inline `mod x { ... }` blocks
+- ✅ `--facade <glob|named|none>` flag / `[output] facade` config option for controlling generated `mod.rs` re-export style
+- ✅ Verbatim source slicing (`src/source_map.rs`) extended to cover individual extracted impl methods
+- ✅ New integration test suites: `acceptance_e2e_tests`, `domain_mapping_tests`, `nested_mod_tests`
+- ✅ `run_workspace_mode` extracted into its own module, `src/workspace_mode.rs`
+- ✅ Dependency bumps: `syn` gained `visit-mut` feature, `proc-macro2` added (`span-locations`), tokio 1.52.1→1.52.3, dashmap 6.1.0→6.2.1
+- ✅ Test suite: 565 tests passing with `--all-features` (494 with default features), was 450 in v0.3.2
 
 **v0.3.2 Highlights (2026-06-09):**
 - ✅ SMT-verified function extraction (`--features smt --extract-pure`): extracts pure integer sub-blocks from over-budget free functions, committing only when OxiZ proves semantic equivalence

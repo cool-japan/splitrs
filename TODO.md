@@ -585,8 +585,21 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Test suite: 450 tests passing (was 269 in v0.3.1)
 - ✅ Codebase: 19,685 lines of Rust across 63 files
 
-### v0.3.3 (Unreleased)
-- 🔲 TBD
+### v0.3.3 (Released 2026-07-06)
+- ✅ Domain-mapping for `--target-modules` (`src/domain_router.rs`): seeded assignment, unknown-name validation, dry-run attribution
+- ✅ Extended `[[target_modules]]` schema: `parent`, `pull_dependencies`, `doc`, `max_lines`, infix/multi-segment glob patterns
+- ✅ `validate_target_modules()`: duplicate module names, empty `items` lists, and catch-all `*` rule ordering checks
+- ✅ Nested inline-mod descent (`--split-nested-mods`, `--max-mod-depth`, `src/nested_mod_splitter.rs`)
+- ✅ `--facade <glob|named|none>` flag / `[output] facade` config option
+- ✅ Verbatim source slicing (`src/source_map.rs`) extended to individual extracted impl methods
+- ✅ New integration test suites: `acceptance_e2e_tests`, `domain_mapping_tests`, `nested_mod_tests`
+- ✅ `run_workspace_mode` extracted into its own module, `src/workspace_mode.rs`
+- ✅ Dependency bumps: `syn` gained `visit-mut` feature, `proc-macro2` (span-locations), tokio 1.52.1→1.52.3, dashmap 6.1.0→6.2.1
+- ✅ Codebase: 28,224 lines across 70 Rust files
+- ✅ Test suite: 565 tests passing with `--all-features` (494 with default features), was 450 in v0.3.2
+
+### v0.3.4 (Unreleased)
+- 🔲 Widen `collect_use_bound_names` (`src/module_generator/functions.rs`) from `pub(super)` to `pub(crate)` so `nested_mod_splitter` can reuse it to enumerate the bindings a generated `mod.rs` recreates for its descended children 
 
 ### v1.0.0 (Production Ready)
 - All critical features implemented
@@ -597,5 +610,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2026-06-09
+**Last Updated:** 2026-07-06
 **Maintainers:** COOLJAPAN OU (Team KitaSan)
