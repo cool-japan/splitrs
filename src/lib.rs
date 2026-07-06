@@ -13,8 +13,10 @@ pub mod trait_bound_analyzer;
 
 // Re-export core analyzers
 pub mod dependency_analyzer;
+pub mod domain_router;
 pub mod field_access_tracker;
 pub mod file_analyzer;
+pub mod nested_mod_splitter;
 pub mod import_analyzer;
 pub mod macro_analyzer;
 pub mod method_analyzer;

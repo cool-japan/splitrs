@@ -22,7 +22,7 @@ lsp = ["dep:tower-lsp", "dep:tokio", "dep:dashmap"]
 smt = ["dep:oxiz", "dep:num-bigint"]
 
 [dependencies]
-syn = { version = "2.0", features = ["full", "parsing", "printing", "visit"] }
+syn = { version = "2.0", features = ["full", "parsing", "printing", "visit", "visit-mut"] }
 quote = "1.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 anyhow = "1.0"

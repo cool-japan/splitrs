@@ -58,9 +58,11 @@
 mod array_splitter;
 mod config;
 mod dependency_analyzer;
+mod domain_router;
 mod error_recovery;
 mod field_access_tracker;
 mod file_analyzer;
+mod nested_mod_splitter;
 mod glob_import_analyzer;
 mod helper_dependency_tracker;
 mod import_analyzer;
@@ -315,18 +317,57 @@ struct Args {
     /// `extended.rs`, `v3.rs`) instead of the default `types.rs`/`functions.rs`
     /// heuristic. See `Config::target_modules` for the schema.
     ///
+    /// Patterns support `Foo` (exact), `Foo*`, `*Foo`, `*foo*`, `a*b*c` and `*`.
+    /// Exact names that match nothing in the file are a hard error (with
+    /// near-miss suggestions). Optional per-rule keys: `parent = "core"`
+    /// (route inside a module descended by --split-nested-mods),
+    /// `pull_dependencies = true` (matched items seed dependency attraction),
+    /// `doc = "..."` (module //! header), `max_lines = N` (per-module budget
+    /// override). Top-level key `assign_unlisted = "heuristic" | "seeded"`
+    /// controls what happens to unlisted items.
+    ///
     /// Example spec:
     /// ```toml
-    /// [[target_modules]]
-    /// name = "extended"
-    /// items = ["FooExt*"]
+    /// assign_unlisted = "seeded"
     ///
     /// [[target_modules]]
-    /// name = "core"
-    /// items = ["*"]
+    /// name = "hash"
+    /// parent = "core"
+    /// items = ["*hash*", "Sha*"]
+    /// pull_dependencies = true
     /// ```
     #[arg(long, value_name = "TOML-FILE")]
     target_modules: Option<PathBuf>,
+
+    /// Descend into inline `mod x { ... }` blocks that exceed the line budget
+    ///
+    /// Each over-budget inline non-test module is split with the full pipeline
+    /// into an `x/` directory module (`x/mod.rs` plus per-topic files),
+    /// recursively, and declared in the parent `mod.rs` with its original
+    /// visibility, attributes and doc comments. `super::` paths inside moved
+    /// items are deepened by one level per descent so semantics are preserved.
+    ///
+    /// Uses `--max-lines` (or the config `max_lines`) as the descend
+    /// threshold. Overrides configuration file if specified.
+    #[arg(long)]
+    split_nested_mods: Option<bool>,
+
+    /// Recursion depth guard for --split-nested-mods (default: 8)
+    ///
+    /// Inline modules nested deeper than this many levels are left opaque.
+    /// Overrides configuration file if specified.
+    #[arg(long, value_name = "N")]
+    max_mod_depth: Option<usize>,
+
+    /// Re-export style in each generated mod.rs: glob | named | none
+    ///
+    /// Controls how historical `crate::x::Item` paths keep resolving:
+    /// `glob` emits `pub use module::*;` (today's style, default), `named`
+    /// emits explicit `pub use module::{Foo, bar};` lists (better rustdoc, no
+    /// glob shadowing), `none` emits declarations only for hand-curated
+    /// re-exports. Overrides the configuration file (`[output] facade`).
+    #[arg(long, value_name = "STYLE")]
+    facade: Option<String>,
 
     /// Prove two pure fixed-width-integer functions semantically equivalent (SMT)
     ///
@@ -528,6 +569,7 @@ fn main() -> Result<()> {
 
     // Merge command-line arguments with configuration
     config.merge_with_args(args.max_lines, args.max_impl_lines, args.split_impl_blocks);
+    config.merge_nested_args(args.split_nested_mods, args.max_mod_depth, args.facade.as_deref());
 
     // --extract-tests CLI flag overrides config when set
     if args.extract_tests {
@@ -536,7 +578,8 @@ fn main() -> Result<()> {
 
     // --target-modules CLI flag loads a standalone TOML file whose
     // [[target_modules]] entries augment any embedded ones from the main
-    // config. Standalone-file rules take precedence and are evaluated first.
+    // config. Standalone-file rules take precedence and are evaluated first;
+    // the file's `assign_unlisted` (if set) overrides the embedded one.
     if let Some(tm_path) = &args.target_modules {
         let spec = config::TargetModulesFile::from_file(tm_path).context(format!(
             "Failed to load target-modules configuration from {:?}\n\
@@ -549,6 +592,36 @@ fn main() -> Result<()> {
         let mut merged = spec.target_modules;
         merged.append(&mut config.target_modules);
         config.target_modules = merged;
+        if spec.assign_unlisted.is_some() {
+            config.assign_unlisted = spec.assign_unlisted;
+        }
+    }
+
+    // Effective Feature C / F2 settings.
+    let split_nested_mods = config.splitrs.split_nested_mods;
+    let max_mod_depth = config.splitrs.max_mod_depth.max(1);
+    let facade = config::FacadeStyle::parse(&config.output.facade)?;
+    let assign_unlisted = config::AssignUnlisted::parse(config.assign_unlisted.as_deref())?;
+    let seeded = assign_unlisted == config::AssignUnlisted::Seeded;
+
+    // Validate the merged rule list before doing any work: duplicate names,
+    // empty item lists and dead rules behind a `*` catch-all are hard errors.
+    config::validate_target_modules(&config.target_modules)?;
+
+    // Rules with `parent = "..."` route items inside a module descended by
+    // --split-nested-mods; they are dead without that mode.
+    let all_rules = config.target_modules.clone();
+    let top_rules: Vec<config::TargetModule> = all_rules
+        .iter()
+        .filter(|rule| rule.parent.is_none())
+        .cloned()
+        .collect();
+    if !split_nested_mods && all_rules.iter().any(|rule| rule.parent.is_some()) {
+        anyhow::bail!(
+            "[[target_modules]] rules with `parent = ...` route items inside nested inline \
+             modules and require --split-nested-mods (or `split_nested_mods = true` in \
+             .splitrs.toml)"
+        );
     }
 
     println!("Configuration loaded:");
@@ -558,8 +631,17 @@ fn main() -> Result<()> {
     if config.splitrs.extract_tests {
         println!("  Extract inline test mods: true");
     }
+    if split_nested_mods {
+        println!(
+            "  Split nested mods: true (max depth {}, facade {:?})",
+            max_mod_depth, config.output.facade
+        );
+    }
     if !config.target_modules.is_empty() {
         println!("  Target modules: {} rule(s)", config.target_modules.len());
+        if seeded {
+            println!("  Assign unlisted items: seeded");
+        }
     }
 
     // Read and parse the input file
@@ -621,9 +703,20 @@ fn main() -> Result<()> {
         config.splitrs.max_impl_lines,
     );
     analyzer.set_extract_tests(config.splitrs.extract_tests);
-    analyzer.set_target_modules(config.target_modules.clone());
+    analyzer.set_target_modules(top_rules.clone());
+    analyzer.set_seeded_assignment(seeded);
+    if split_nested_mods {
+        analyzer.set_split_nested_mods(true, config.splitrs.max_lines);
+    }
     analyzer.set_source(&source_code);
     analyzer.analyze_with_test_files(&syntax_tree, input);
+
+    // F2: exact (non-glob) rule items that name nothing in this scope are a
+    // hard error with near-miss suggestions.
+    domain_router::check_unmatched_patterns(
+        &domain_router::routable_names(&analyzer),
+        &top_rules,
+    )?;
 
     println!("Found {} types", analyzer.types.len());
     println!("Found {} standalone items", analyzer.standalone_items.len());
@@ -634,8 +727,55 @@ fn main() -> Result<()> {
         println!("Found {} trait implementations", total_trait_impls);
     }
 
+    // Feature C: plan the recursive split of every diverted inline module.
+    // Planning is side-effect free so --dry-run can preview the full tree.
+    let nested_mods = analyzer.take_nested_mods();
+    let mut nested_plans: Vec<nested_mod_splitter::NestedModPlan> = Vec::new();
+    if !nested_mods.is_empty() {
+        let opts = nested_mod_splitter::NestedSplitOptions {
+            split_impl_blocks: config.splitrs.split_impl_blocks,
+            max_impl_lines: config.splitrs.max_impl_lines,
+            max_lines: config.splitrs.max_lines,
+            extract_tests: config.splitrs.extract_tests,
+            max_mod_depth,
+            seeded_assignment: seeded,
+            all_rules: &all_rules,
+        };
+        for nested in &nested_mods {
+            let mod_path = nested.ident.to_string();
+            nested_plans.push(nested_mod_splitter::plan_nested_split(
+                nested,
+                &source_code,
+                &opts,
+                &mod_path,
+                1,
+            )?);
+        }
+        println!("Descending into {} nested module(s)", nested_plans.len());
+    }
+    // Every `parent = "..."` rule must have found its descended module.
+    nested_mod_splitter::validate_parent_rules(&all_rules, &nested_plans)?;
+    if nested_plans.iter().any(|plan| plan.name == "tests")
+        && !analyzer.extracted_tests.is_empty()
+    {
+        anyhow::bail!(
+            "a nested module named `tests` conflicts with the tests.rs produced by \
+             --extract-tests; re-run without --extract-tests or rename the module"
+        );
+    }
+
     // Group into modules
     let mut modules = analyzer.group_by_module(config.splitrs.max_lines);
+    if !nested_plans.is_empty() {
+        // Generated bucket names must yield to real child module names, and
+        // sibling files referencing a child mod by bare path (`core::init()`)
+        // need a `use super::core;` import.
+        let reserved: std::collections::HashSet<String> =
+            nested_plans.iter().map(|plan| plan.name.clone()).collect();
+        nested_mod_splitter::rename_module_collisions(&mut modules, &reserved);
+        let child_names: Vec<String> = nested_plans.iter().map(|plan| plan.name.clone()).collect();
+        nested_mod_splitter::add_child_mod_imports(&mut modules, &child_names);
+    }
     // When splitting a leaf sub-module in place into a same-named directory,
     // generated modules sit one level deeper, so inherited `super::` imports
     // must be deepened by one segment.
@@ -701,10 +841,43 @@ fn main() -> Result<()> {
             println!();
         }
 
+        // F2 transparency: per named module, attribute every item to the rule
+        // pattern that routed it (or mark it as pulled in by seeding).
+        if !top_rules.is_empty() {
+            let mut printed_header = false;
+            for module in &modules {
+                let Some(lines) = domain_router::explain_named_module(module, &top_rules) else {
+                    continue;
+                };
+                if !printed_header {
+                    println!("\n🧭 Rule attribution (named modules):");
+                    printed_header = true;
+                }
+                println!("  📄 {}.rs", module.name);
+                for line in lines {
+                    println!("    - {}", line);
+                }
+            }
+        }
+
+        if !nested_plans.is_empty() {
+            println!("\n📁 Nested module tree (--split-nested-mods):");
+            for plan in &nested_plans {
+                for line in nested_mod_splitter::dry_run_lines(plan, 1) {
+                    println!("{}", line);
+                }
+            }
+        }
+
         println!("\n💾 Files that would be created:");
         println!("  📁 {}/", output.display());
         for module in &modules {
             println!("    📄 {}.rs", module.name);
+        }
+        for plan in &nested_plans {
+            for line in nested_mod_splitter::dry_run_lines(plan, 2) {
+                println!("{}", line);
+            }
         }
         println!("    📄 mod.rs");
 
@@ -861,6 +1034,15 @@ fn main() -> Result<()> {
         created_count += 1;
     }
 
+    // Feature C: write each planned nested module tree under the output dir.
+    for plan in &nested_plans {
+        let files = nested_mod_splitter::write_plan(plan, output, facade)?;
+        for file in &files {
+            println!("Created: {:?}", file);
+        }
+        created_count += files.len();
+    }
+
     // Write tests.rs when --extract-tests produced inline test modules.
     // This must happen before mod.rs generation so we know whether to add
     // `#[cfg(test)] mod tests;` to mod.rs.
@@ -913,12 +1095,17 @@ fn main() -> Result<()> {
     let lib_rs_path = output.join("lib.rs");
     if !lib_rs_path.exists() {
         let test_module_path = extract_test_module_path(&syntax_tree);
-        let mod_content = generate_mod_rs(
+        let child_decls: Vec<syn::ItemMod> =
+            nested_plans.iter().map(|plan| plan.decl_item()).collect();
+        let mod_content = module_generator::generate_mod_rs_ext(
             &modules,
             output,
             test_module_path.as_deref(),
             has_extracted_tests,
             &analyzer.file_inner_docs,
+            &[],
+            &child_decls,
+            facade,
         )?;
         let mod_path = output.join("mod.rs");
         fs::write(&mod_path, &mod_content).context(format!(
@@ -936,6 +1123,17 @@ fn main() -> Result<()> {
         }
 
         println!("Created: {:?}", mod_path);
+    } else if !nested_plans.is_empty() {
+        eprintln!(
+            "Note: {} exists, so no mod.rs was written. Declare the descended module(s) there \
+             manually: {}",
+            lib_rs_path.display(),
+            nested_plans
+                .iter()
+                .map(|plan| format!("`mod {};`", plan.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // Remove the original input file when splitting a leaf sub-module *in place*

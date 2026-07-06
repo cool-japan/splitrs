@@ -269,10 +269,12 @@ fn target_modules_routes_struct_to_named_module() {
         TargetModule {
             name: "core".to_string(),
             items: vec!["Foo".to_string(), "Bar".to_string()],
+            ..Default::default()
         },
         TargetModule {
             name: "extended".to_string(),
             items: vec!["Baz*".to_string()],
+            ..Default::default()
         },
     ];
     let (_, analyzer) = analyzer_with(code, false, rules);
@@ -312,6 +314,7 @@ fn target_modules_routes_functions_consts_statics() {
     let rules = vec![TargetModule {
         name: "v3".to_string(),
         items: vec!["do_v3_thing".to_string(), "V3_*".to_string()],
+        ..Default::default()
     }];
     let (_, analyzer) = analyzer_with(code, false, rules);
     let modules = analyzer.group_by_module(500);
@@ -345,6 +348,7 @@ fn target_modules_routes_impl_for_foreign_type() {
     let rules = vec![TargetModule {
         name: "foo_impls".to_string(),
         items: vec!["Foo".to_string()],
+        ..Default::default()
     }];
     let (_, analyzer) = analyzer_with(code, false, rules);
     let modules = analyzer.group_by_module(500);
@@ -372,10 +376,12 @@ fn target_modules_first_match_wins() {
         TargetModule {
             name: "v3".to_string(),
             items: vec!["FooV3".to_string()],
+            ..Default::default()
         },
         TargetModule {
             name: "extended".to_string(),
             items: vec!["Foo*".to_string()],
+            ..Default::default()
         },
     ];
     let (_, analyzer) = analyzer_with(code, false, rules);
@@ -403,10 +409,12 @@ fn target_modules_wildcard_catches_everything_else() {
         TargetModule {
             name: "v3".to_string(),
             items: vec!["*V3".to_string()],
+            ..Default::default()
         },
         TargetModule {
             name: "everything".to_string(),
             items: vec!["*".to_string()],
+            ..Default::default()
         },
     ];
     let (_, analyzer) = analyzer_with(code, false, rules);
@@ -434,10 +442,12 @@ fn target_modules_empty_rule_module_is_not_emitted() {
         TargetModule {
             name: "v3".to_string(),
             items: vec!["FooV3".to_string()],
+            ..Default::default()
         },
         TargetModule {
             name: "core".to_string(),
             items: vec!["Foo".to_string()],
+            ..Default::default()
         },
     ];
     let (_, analyzer) = analyzer_with(code, false, rules);
@@ -474,6 +484,7 @@ fn combined_extract_tests_and_target_modules() {
     let rules = vec![TargetModule {
         name: "core".to_string(),
         items: vec!["Foo".to_string(), "Bar".to_string()],
+        ..Default::default()
     }];
 
     let file = parse(code);
@@ -572,6 +583,7 @@ fn route_item_returns_none_when_no_rule_matches() {
     let rules = vec![TargetModule {
         name: "v3".to_string(),
         items: vec!["FooV3".to_string()],
+        ..Default::default()
     }];
     assert_eq!(route_item("Bar", &rules), None);
     assert_eq!(route_item("FooV3", &rules), Some("v3"));
@@ -596,6 +608,7 @@ fn target_modules_bundles_trait_impls_with_type() {
     let rules = vec![TargetModule {
         name: "core".to_string(),
         items: vec!["Foo".to_string()],
+        ..Default::default()
     }];
     let (_, analyzer) = analyzer_with(code, false, rules);
     let modules = analyzer.group_by_module(500);

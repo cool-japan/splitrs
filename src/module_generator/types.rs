@@ -87,6 +87,16 @@ pub struct Module {
     /// extra `super` segment, because the moved code now sits one module level
     /// deeper. Defaults to `false`, preserving classic flat-output behaviour.
     pub deepen_super: bool,
+    /// Custom module documentation (F2 per-rule `doc = "..."`).
+    ///
+    /// When set, emitted as the generated file's `//!` header instead of the
+    /// generic template. Multi-line strings become multiple `//!` lines.
+    pub module_doc: Option<String>,
+    /// Names of sibling directory modules (nested inline mods descended by
+    /// Feature C) that this module's items reference by bare path (e.g. a
+    /// call to `core::init()` when `mod core` became `core/`). Emitted as
+    /// `use super::<name>;` so those paths keep resolving after the split.
+    pub sibling_mod_imports: Vec<String>,
 }
 impl Module {
     /// Creates a new empty module with the given name
@@ -106,6 +116,8 @@ impl Module {
             type_name_for_traits: None,
             trait_impls: Vec::new(),
             deepen_super: false,
+            module_doc: None,
+            sibling_mod_imports: Vec::new(),
         }
     }
     /// Get the types exported by this module
@@ -159,6 +171,30 @@ impl Module {
         self.standalone_items
             .iter()
             .any(|item| matches!(item_visibility(item), Some(syn::Visibility::Public(_))))
+    }
+    /// Names of the `pub` items this module defines — the set an explicit
+    /// (`--facade named`) re-export list must cover so historical
+    /// `crate::x::Item` paths keep resolving. Sorted and deduplicated.
+    pub fn public_export_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for type_info in &self.types {
+            if matches!(
+                item_visibility(&type_info.item),
+                Some(syn::Visibility::Public(_))
+            ) {
+                names.push(type_info.name.clone());
+            }
+        }
+        for item in &self.standalone_items {
+            if matches!(item_visibility(item), Some(syn::Visibility::Public(_))) {
+                if let Some(ident) = item_defined_ident(item) {
+                    names.push(ident);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
     /// Collect all symbols used in this module's items
     pub(super) fn collect_used_symbols(&self) -> HashSet<String> {
@@ -398,7 +434,7 @@ impl Module {
     /// module resolves on its own (its own type definitions, free functions,
     /// consts, etc.) versus which must come from an import. A name defined here
     /// never needs a glob to resolve it.
-    pub(super) fn local_item_names(&self) -> HashSet<String> {
+    pub(crate) fn local_item_names(&self) -> HashSet<String> {
         let mut names = HashSet::new();
         for type_info in &self.types {
             names.insert(type_info.name.clone());
@@ -418,7 +454,7 @@ impl Module {
     /// idents) that drives import pruning. Preferred over the textual
     /// [`rendered_code`](Self::rendered_code)-based probes because it is immune to
     /// doc-comment text and declaration-site identifiers.
-    pub(super) fn analyze_references(&self) -> RefVisitor {
+    pub(crate) fn analyze_references(&self) -> RefVisitor {
         let mut v = RefVisitor::default();
         for type_info in &self.types {
             v.visit_item(&type_info.item);
@@ -786,7 +822,19 @@ impl Module {
         trait_tracker: Option<&TraitMethodTracker>,
     ) -> String {
         let mut content = String::new();
-        if let Some(type_name) = &self.type_name_for_traits {
+        if let Some(doc) = &self.module_doc {
+            for line in doc.lines() {
+                if line.trim().is_empty() {
+                    content.push_str("//!\n");
+                } else {
+                    content.push_str(&format!("//! {}\n", line));
+                }
+            }
+            content.push_str("//!\n");
+            content.push_str(
+                "//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)\n\n",
+            );
+        } else if let Some(type_name) = &self.type_name_for_traits {
             content.push_str(&format!(
                 "//! # `{}` - Trait Implementations\n//!\n",
                 type_name
@@ -931,6 +979,15 @@ impl Module {
                 .push(type_name);
         }
         let mut has_super_imports = !imports_by_module.is_empty();
+        // Sibling directory modules (nested inline mods descended by Feature
+        // C) referenced by bare path from this module's items. `use
+        // super::<name>;` restores the original file-scope resolution of
+        // paths like `core::init()`. Siblings sit at the same level, so no
+        // deepening applies here (mirrors the sibling fn imports below).
+        for sibling in &self.sibling_mod_imports {
+            content.push_str(&format!("use super::{};\n", sibling));
+            has_super_imports = true;
+        }
         for (module_name, mut types) in imports_by_module {
             types.sort();
             types.dedup();

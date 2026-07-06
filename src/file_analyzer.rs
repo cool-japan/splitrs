@@ -130,6 +130,23 @@ pub struct FileAnalyzer {
     /// [`Self::set_target_modules`].
     target_modules: Vec<TargetModule>,
 
+    /// Whether seeded assignment of unlisted items is enabled globally
+    /// (`assign_unlisted = "seeded"`). Set via [`Self::set_seeded_assignment`].
+    seeded_assignment: bool,
+
+    /// Whether to divert over-budget inline `mod x { ... }` blocks into
+    /// [`Self::nested_mods`] for recursive splitting (Feature C).
+    /// Set via [`Self::set_split_nested_mods`].
+    split_nested_mods: bool,
+
+    /// Line budget an inline module must exceed to be diverted for nested
+    /// splitting. Set together with [`Self::set_split_nested_mods`].
+    nested_mod_budget: usize,
+
+    /// Inline (non-test) modules diverted for recursive splitting when
+    /// `split_nested_mods` is enabled. Drained via [`Self::take_nested_mods`].
+    pub nested_mods: Vec<syn::ItemMod>,
+
     /// Item #5: File-level `//!` inner doc attributes captured from the
     /// parsed `syn::File.attrs`. These are emitted at the top of `mod.rs`
     /// and the primary module file to preserve crate/module documentation.
@@ -163,6 +180,10 @@ impl FileAnalyzer {
             extract_tests: false,
             extracted_tests: Vec::new(),
             target_modules: Vec::new(),
+            seeded_assignment: false,
+            split_nested_mods: false,
+            nested_mod_budget: usize::MAX,
+            nested_mods: Vec::new(),
             file_inner_docs: Vec::new(),
             source_code: None,
         }
@@ -187,7 +208,7 @@ impl FileAnalyzer {
     /// including its leading attributes/doc comments and original indentation.
     /// Returns `None` when no source is available (the verbatim path is then
     /// skipped and emission falls back to prettyplease).
-    fn standalone_verbatim_for(&self, item: &syn::Item) -> Option<String> {
+    pub(crate) fn standalone_verbatim_for(&self, item: &syn::Item) -> Option<String> {
         use syn::spanned::Spanned;
         let src = self.source_code.as_deref()?;
         let sm = crate::source_map::SourceMap::new(src);
@@ -201,6 +222,39 @@ impl FileAnalyzer {
     /// first matching rule wins. An empty list disables routing.
     pub fn set_target_modules(&mut self, rules: Vec<TargetModule>) {
         self.target_modules = rules;
+    }
+
+    /// Enable or disable global seeded assignment of unlisted items
+    /// (`assign_unlisted = "seeded"`). Individual rules can also opt in via
+    /// `pull_dependencies = true` regardless of this flag.
+    pub fn set_seeded_assignment(&mut self, enabled: bool) {
+        self.seeded_assignment = enabled;
+    }
+
+    /// Whether global seeded assignment is enabled.
+    pub(crate) fn seeded_assignment_enabled(&self) -> bool {
+        self.seeded_assignment
+    }
+
+    /// The installed target-module routing rules.
+    pub(crate) fn target_rules(&self) -> &[TargetModule] {
+        &self.target_modules
+    }
+
+    /// Enable or disable nested inline-mod descent (Feature C).
+    ///
+    /// When enabled, [`Self::analyze`] diverts inline non-test `mod x { ... }`
+    /// blocks whose source span exceeds `budget` lines into
+    /// [`Self::nested_mods`] instead of `standalone_items`, so the caller can
+    /// recursively split them with the full pipeline.
+    pub fn set_split_nested_mods(&mut self, enabled: bool, budget: usize) {
+        self.split_nested_mods = enabled;
+        self.nested_mod_budget = budget;
+    }
+
+    /// Drain the diverted inline modules collected for nested splitting.
+    pub fn take_nested_mods(&mut self) -> Vec<syn::ItemMod> {
+        std::mem::take(&mut self.nested_mods)
     }
 
     /// Drain the collected inline test modules, leaving the analyzer empty.
@@ -375,6 +429,18 @@ impl FileAnalyzer {
                         continue;
                     }
 
+                    // Feature C (--split-nested-mods): divert over-budget
+                    // inline non-test modules for recursive splitting instead
+                    // of carrying them as one opaque standalone item. This is
+                    // exactly the case where a file dominated by one large
+                    // `pub mod core { ... }` was previously unsplittable.
+                    if self.split_nested_mods
+                        && Self::is_splittable_nested_mod(mod_item, self.nested_mod_budget)
+                    {
+                        self.nested_mods.push(mod_item.clone());
+                        continue;
+                    }
+
                     self.standalone_items.push(item.clone());
                 }
                 _ => {
@@ -411,8 +477,7 @@ impl FileAnalyzer {
                         if ident == "cfg" {
                             // Check if this is #[cfg(test)]
                             if let syn::Meta::List(meta_list) = &attr.meta {
-                                let tokens = meta_list.tokens.to_string();
-                                if tokens.contains("test") {
+                                if cfg_tokens_mention_test(&meta_list.tokens) {
                                     is_test = true;
                                 }
                             }
@@ -490,8 +555,7 @@ impl FileAnalyzer {
             if let Some(ident) = meta_path.get_ident() {
                 if ident == "cfg" {
                     if let syn::Meta::List(meta_list) = &attr.meta {
-                        let tokens = meta_list.tokens.to_string();
-                        if tokens.contains("test") {
+                        if cfg_tokens_mention_test(&meta_list.tokens) {
                             is_test = true;
                         }
                     }
@@ -519,7 +583,7 @@ impl FileAnalyzer {
             if let Some(ident) = meta_path.get_ident() {
                 if ident == "cfg" {
                     if let syn::Meta::List(meta_list) = &attr.meta {
-                        if meta_list.tokens.to_string().contains("test") {
+                        if cfg_tokens_mention_test(&meta_list.tokens) {
                             is_test = true;
                         }
                     }
@@ -529,6 +593,32 @@ impl FileAnalyzer {
             }
         }
         is_test && !has_path
+    }
+
+    /// Whether an inline module qualifies for nested descent (Feature C):
+    /// it must have an inline body, must not be a test module or carry a
+    /// `#[path]` redirect, and its source span must exceed `budget` lines.
+    ///
+    /// The line count uses real span locations (`proc-macro2` is compiled
+    /// with `span-locations`), so no source text is required here.
+    fn is_splittable_nested_mod(mod_item: &syn::ItemMod, budget: usize) -> bool {
+        use syn::spanned::Spanned;
+        if mod_item.content.is_none() {
+            return false; // bare `mod foo;` declaration
+        }
+        if Self::is_inline_test_module(mod_item) {
+            return false; // test mods flow through the tests machinery
+        }
+        if mod_item
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("path"))
+        {
+            return false; // `#[path]` redirects are left untouched
+        }
+        let span = mod_item.span();
+        let lines = span.end().line.saturating_sub(span.start().line) + 1;
+        lines > budget
     }
 
     /// Get recommended visibility for a type's fields based on impl organization
@@ -901,8 +991,9 @@ impl FileAnalyzer {
 
         // Emit named target modules at the end, in the order they were
         // declared in the config. Empty target modules (those whose patterns
-        // matched nothing) are skipped.
-        modules.extend(routing.into_modules());
+        // matched nothing) are skipped; modules whose rule declares a
+        // `max_lines` budget overflow into `<name>_2`, `<name>_3`, ...
+        modules.extend(routing.into_modules(&self.target_modules));
 
         modules
     }
@@ -924,7 +1015,9 @@ impl FileAnalyzer {
         let mut modules_by_name: HashMap<String, usize> = HashMap::new();
         for tm in &self.target_modules {
             let idx = routing.modules.len();
-            routing.modules.push(Module::new(tm.name.clone()));
+            let mut module = Module::new(tm.name.clone());
+            module.module_doc = tm.doc.clone();
+            routing.modules.push(module);
             modules_by_name.insert(tm.name.clone(), idx);
         }
 
@@ -966,6 +1059,14 @@ impl FileAnalyzer {
                 .standalone_verbatim
                 .push(self.standalone_verbatim_for(item));
             routing.routed_standalone_indices.insert(idx);
+        }
+
+        // F2 seeded assignment: routed items act as seeds; unlisted items
+        // with reference affinity to a named module are pulled in (fixpoint).
+        // Enabled globally via `assign_unlisted = "seeded"` or per-rule via
+        // `pull_dependencies = true`.
+        if self.seeded_assignment || self.target_modules.iter().any(|tm| tm.pull_dependencies) {
+            crate::domain_router::seeded_assign(self, &mut routing);
         }
 
         routing
@@ -1286,34 +1387,143 @@ fn pick_unique_module_name(
 /// Carries the assembled named modules alongside the indices of the
 /// inputs that were consumed by routing, so the heuristic passes can
 /// filter them out without disturbing the original collection ordering.
+/// `pub(crate)` so the seeded-assignment pass in `domain_router` can extend
+/// the routing in place.
 #[derive(Default)]
-struct TargetRouting {
+pub(crate) struct TargetRouting {
     /// One `Module` per declared rule, in the order rules were listed in
     /// the config. Some may be empty if no item matched their patterns.
-    modules: Vec<Module>,
+    pub(crate) modules: Vec<Module>,
 
     /// Type names that were routed to a named module. The heuristic passes
     /// skip these when iterating `self.types`.
-    routed_type_names: HashSet<String>,
+    pub(crate) routed_type_names: HashSet<String>,
 
     /// Indices into `self.standalone_items` that were routed. The heuristic
     /// standalone-items pass skips these.
-    routed_standalone_indices: HashSet<usize>,
+    pub(crate) routed_standalone_indices: HashSet<usize>,
 }
 
 impl TargetRouting {
-    /// Consume the routing and yield only the non-empty named modules.
-    fn into_modules(self) -> Vec<Module> {
-        self.modules
-            .into_iter()
-            .filter(|m| {
-                !m.types.is_empty()
-                    || !m.standalone_items.is_empty()
-                    || !m.trait_impls.is_empty()
-                    || m.method_group.is_some()
-            })
-            .collect()
+    /// Consume the routing and yield only the non-empty named modules, in
+    /// rule-declaration order. A module whose rule declares `max_lines`
+    /// overflows into `<name>_2`, `<name>_3`, ... when its content exceeds
+    /// the budget (the same suffix convention as trait-impl batching).
+    fn into_modules(self, rules: &[TargetModule]) -> Vec<Module> {
+        let mut out = Vec::new();
+        for (idx, module) in self.modules.into_iter().enumerate() {
+            let is_empty = module.types.is_empty()
+                && module.standalone_items.is_empty()
+                && module.trait_impls.is_empty()
+                && module.method_group.is_none();
+            if is_empty {
+                continue;
+            }
+            match rules.get(idx).and_then(|r| r.max_lines) {
+                Some(budget) => out.extend(split_named_module_by_budget(module, budget)),
+                None => out.push(module),
+            }
+        }
+        out
     }
+}
+
+/// Split one routed named module into budget-respecting chunks named
+/// `<name>`, `<name>_2`, `<name>_3`, ... Types (with their bundled impls and
+/// trait impls) and standalone items are distributed in order; the verbatim
+/// alignment of standalone items is preserved.
+fn split_named_module_by_budget(module: Module, budget: usize) -> Vec<Module> {
+    let base_name = module.name.clone();
+    let module_doc = module.module_doc.clone();
+    let mut out: Vec<Module> = Vec::new();
+
+    let new_chunk = |count: usize| -> Module {
+        let name = if count == 0 {
+            base_name.clone()
+        } else {
+            format!("{}_{}", base_name, count + 1)
+        };
+        let mut chunk = Module::new(name);
+        chunk.module_doc = module_doc.clone();
+        chunk
+    };
+
+    let chunk_has_content =
+        |m: &Module| !m.types.is_empty() || !m.standalone_items.is_empty();
+
+    let mut current = new_chunk(0);
+    let mut current_lines: usize = 0;
+
+    for type_info in module.types {
+        let trait_lines: usize = type_info
+            .trait_impls
+            .iter()
+            .map(|ti| {
+                prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![ti.impl_item.clone()],
+                })
+                .lines()
+                .count()
+            })
+            .sum();
+        let lines = type_info.estimate_lines() + trait_lines;
+        if current_lines + lines > budget && chunk_has_content(&current) {
+            out.push(current);
+            current = new_chunk(out.len());
+            current_lines = 0;
+        }
+        current.types.push(type_info);
+        current_lines += lines;
+    }
+
+    debug_assert_eq!(
+        module.standalone_items.len(),
+        module.standalone_verbatim.len(),
+        "routed standalone items must stay verbatim-aligned"
+    );
+    for (item, verbatim) in module
+        .standalone_items
+        .into_iter()
+        .zip(module.standalone_verbatim)
+    {
+        let lines = estimate_item_lines(&item);
+        if current_lines + lines > budget && chunk_has_content(&current) {
+            out.push(current);
+            current = new_chunk(out.len());
+            current_lines = 0;
+        }
+        current.standalone_items.push(item);
+        current.standalone_verbatim.push(verbatim);
+        current_lines += lines;
+    }
+
+    if chunk_has_content(&current) || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Structural check for `test` inside a `#[cfg(...)]` token stream.
+///
+/// The previous heuristic (`tokens.to_string().contains("test")`) also fired
+/// for unrelated cfgs such as `#[cfg(feature = "testkit")]`, misclassifying
+/// them as test modules. This walks the token trees and only matches a bare
+/// `test` identifier (covers `test`, `any(test, ...)`, `all(test, ...)`).
+pub(crate) fn cfg_tokens_mention_test(tokens: &proc_macro2::TokenStream) -> bool {
+    for tt in tokens.clone() {
+        match tt {
+            proc_macro2::TokenTree::Ident(ident) if ident == "test" => return true,
+            proc_macro2::TokenTree::Group(group)
+                if cfg_tokens_mention_test(&group.stream()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Borrow the attribute slice of any `syn::Item` kind that carries attributes.
@@ -1348,7 +1558,7 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
 /// For `impl Foo` and `impl Trait for Foo` blocks left in `standalone_items`
 /// (because the type isn't in this file's `types` map), routes by the
 /// impl-target type name.
-fn standalone_routing_name(item: &Item) -> Option<String> {
+pub(crate) fn standalone_routing_name(item: &Item) -> Option<String> {
     match item {
         Item::Fn(f) => Some(f.sig.ident.to_string()),
         Item::Const(c) => Some(c.ident.to_string()),

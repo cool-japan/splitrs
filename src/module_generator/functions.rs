@@ -144,7 +144,7 @@ pub(crate) fn deepen_super_in_use(use_item: &Item) -> Item {
     Item::Use(u)
 }
 /// Prepend a `super::` segment to a `UseTree` whose head identifier is `super`.
-fn deepen_super_in_use_tree(tree: &mut syn::UseTree) {
+pub(crate) fn deepen_super_in_use_tree(tree: &mut syn::UseTree) {
     use syn::UseTree;
     if let UseTree::Path(p) = tree {
         if p.ident == "super" {
@@ -451,11 +451,50 @@ pub(super) fn apply_specific_field_visibility(
 /// The content of `mod.rs` as a string
 pub fn generate_mod_rs(
     modules: &[Module],
-    _output_dir: &Path,
+    output_dir: &Path,
     test_module_path: Option<&str>,
     has_extracted_tests: bool,
     file_inner_docs: &[syn::Attribute],
 ) -> Result<String> {
+    generate_mod_rs_ext(
+        modules,
+        output_dir,
+        test_module_path,
+        has_extracted_tests,
+        file_inner_docs,
+        &[],
+        &[],
+        crate::config::FacadeStyle::Glob,
+    )
+}
+
+/// Extended `mod.rs` generator (Feature C).
+///
+/// In addition to everything [`generate_mod_rs`] does, this:
+///
+/// - emits non-doc *inner* attributes (`#![allow(...)]`, ...) carried over
+///   from an inline module body (`file_inner_attrs`);
+/// - declares each descended child directory module (`child_mods`, given as
+///   declaration-form `syn::ItemMod`s — `content: None` — so the original
+///   visibility, `#[cfg]` attributes and `///` doc comments are preserved
+///   exactly); child mods get *no* re-export: their items must stay at
+///   `...::<child>::Item`, exactly where they were before the split;
+/// - renders the re-export facade for the generated modules according to
+///   `facade` (`glob` — today's `pub use m::*;` style, `named` — explicit
+///   `pub use m::{A, b};` lists, or `none`).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_mod_rs_ext(
+    modules: &[Module],
+    _output_dir: &Path,
+    test_module_path: Option<&str>,
+    has_extracted_tests: bool,
+    file_inner_docs: &[syn::Attribute],
+    file_inner_attrs: &[syn::Attribute],
+    child_mods: &[syn::ItemMod],
+    facade: crate::config::FacadeStyle,
+) -> Result<String> {
+    use crate::config::FacadeStyle;
+
     let mut content = String::new();
     for attr in file_inner_docs {
         if let syn::Meta::NameValue(nv) = &attr.meta {
@@ -480,14 +519,59 @@ pub fn generate_mod_rs(
     } else {
         content.push('\n');
     }
+    // Non-doc inner attributes from the original module body (e.g.
+    // `#![allow(dead_code)]`) keep applying to the whole directory module.
+    if !file_inner_attrs.is_empty() {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: file_inner_attrs.to_vec(),
+            items: Vec::new(),
+        });
+        content.push_str(&rendered);
+        content.push('\n');
+    }
     for module in modules {
         content.push_str(&format!("pub mod {};\n", module.name));
     }
-    content.push_str("\n// Re-export all types\n");
-    for module in modules {
-        if module.has_public_reexport() {
-            content.push_str(&format!("pub use {}::*;\n", module.name));
+    // Child directory modules (descended nested mods). Rendering the
+    // declaration-form ItemMod through prettyplease preserves attributes,
+    // `///` docs, and the original visibility (`pub`, `pub(crate)`, private).
+    for child in child_mods {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: vec![Item::Mod(child.clone())],
+        });
+        content.push_str(&rendered);
+    }
+    match facade {
+        FacadeStyle::Glob => {
+            content.push_str("\n// Re-export all types\n");
+            for module in modules {
+                if module.has_public_reexport() {
+                    content.push_str(&format!("pub use {}::*;\n", module.name));
+                }
+            }
         }
+        FacadeStyle::Named => {
+            content.push_str("\n// Re-export all types\n");
+            for module in modules {
+                let names = module.public_export_names();
+                if names.is_empty() {
+                    continue;
+                }
+                if names.len() == 1 {
+                    content.push_str(&format!("pub use {}::{};\n", module.name, names[0]));
+                } else {
+                    content.push_str(&format!(
+                        "pub use {}::{{{}}};\n",
+                        module.name,
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        FacadeStyle::None => {}
     }
     if let Some(test_path) = test_module_path {
         content.push_str("\n#[cfg(test)]\n");
