@@ -115,7 +115,7 @@ pub(super) fn std_prelude_names() -> &'static [&'static str] {
 /// name can be referenced as a path-root elsewhere (structs, enums, fns,
 /// consts, statics, type aliases, traits, unions, and macro definitions). Items
 /// without a single defining ident (impls, use, extern blocks) return `None`.
-pub(super) fn item_defined_ident(item: &Item) -> Option<String> {
+pub(crate) fn item_defined_ident(item: &Item) -> Option<String> {
     let ident = match item {
         Item::Struct(i) => &i.ident,
         Item::Enum(i) => &i.ident,
@@ -465,6 +465,7 @@ pub fn generate_mod_rs(
         &[],
         &[],
         crate::config::FacadeStyle::Glob,
+        &[],
     )
 }
 
@@ -474,6 +475,9 @@ pub fn generate_mod_rs(
 ///
 /// - emits non-doc *inner* attributes (`#![allow(...)]`, ...) carried over
 ///   from an inline module body (`file_inner_attrs`);
+/// - emits `scope_uses` — `use` items that recreate the original file-scope
+///   bindings the descended child modules resolve through (`use super::*;`
+///   chains and `super::name` paths from inside a moved mod body land here);
 /// - declares each descended child directory module (`child_mods`, given as
 ///   declaration-form `syn::ItemMod`s — `content: None` — so the original
 ///   visibility, `#[cfg]` attributes and `///` doc comments are preserved
@@ -482,6 +486,11 @@ pub fn generate_mod_rs(
 /// - renders the re-export facade for the generated modules according to
 ///   `facade` (`glob` — today's `pub use m::*;` style, `named` — explicit
 ///   `pub use m::{A, b};` lists, or `none`).
+///
+/// Modules that define `macro_rules!` macros are declared FIRST and carry
+/// `#[macro_use]`, so their macros stay textually visible to every other
+/// generated module and to the child directory modules (macro_rules scoping
+/// is textual and ordered).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_mod_rs_ext(
     modules: &[Module],
@@ -492,6 +501,7 @@ pub fn generate_mod_rs_ext(
     file_inner_attrs: &[syn::Attribute],
     child_mods: &[syn::ItemMod],
     facade: crate::config::FacadeStyle,
+    scope_uses: &[Item],
 ) -> Result<String> {
     use crate::config::FacadeStyle;
 
@@ -530,7 +540,33 @@ pub fn generate_mod_rs_ext(
         content.push_str(&rendered);
         content.push('\n');
     }
-    for module in modules {
+    // Recreate the original file-scope `use` bindings that descended child
+    // modules resolve through (they reference this scope via `super::` paths
+    // and forwarded `use super::*;` globs). Private `use` bindings in a
+    // module ARE visible to its descendants, so this restores the original
+    // resolution chain without widening the public API.
+    if !scope_uses.is_empty() {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: scope_uses.to_vec(),
+        });
+        content.push_str(&rendered);
+        content.push('\n');
+    }
+    // `macro_rules!` scoping is textual and ordered: modules that define
+    // macros are declared first and carry `#[macro_use]` so their macros are
+    // visible in every later sibling module and in the child directory mods.
+    let defines_macro = |module: &Module| {
+        module
+            .standalone_items
+            .iter()
+            .any(|item| matches!(item, Item::Macro(m) if m.ident.is_some()))
+    };
+    for module in modules.iter().filter(|m| defines_macro(m)) {
+        content.push_str(&format!("#[macro_use]\npub mod {};\n", module.name));
+    }
+    for module in modules.iter().filter(|m| !defines_macro(m)) {
         content.push_str(&format!("pub mod {};\n", module.name));
     }
     // Child directory modules (descended nested mods). Rendering the

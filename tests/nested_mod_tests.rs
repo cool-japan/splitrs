@@ -641,8 +641,212 @@ fn cli_split_nested_mods_end_to_end() {
     // The child mod is declared but NOT re-exported at the parent: items must
     // stay at crate::core::Item exactly where they were.
     assert!(!mod_rs.contains("pub use core::*;"), "{mod_rs}");
+    // The mod body resolved `HashMap` through `use super::*;` — the original
+    // file-scope binding must be recreated in mod.rs so the chain still works.
+    assert!(
+        mod_rs.contains("use std::collections::HashMap;"),
+        "file-scope use binding not recreated for the descended mod:\n{mod_rs}"
+    );
     assert!(output.join("core").join("mod.rs").exists());
     assert_all_files_parse(&output);
+}
+
+#[test]
+fn parent_scope_items_bind_private_fns_and_prune_uses() {
+    use splitrs::nested_mod_splitter::compute_parent_scope_items;
+
+    let code = r#"
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn top_helper() -> u64 { 41 }
+
+        pub mod core {
+            use super::*;
+
+            pub fn probe(map: &HashMap<String, u64>) -> u64 {
+                super::top_helper() + map.len() as u64
+            }
+        }
+    "#;
+    let file = syn::parse_file(code).expect("parse");
+    let mut analyzer = FileAnalyzer::new(false, 500);
+    analyzer.set_split_nested_mods(true, 3);
+    analyzer.set_source(code);
+    analyzer.analyze(&file);
+    let nested = analyzer.take_nested_mods();
+    assert_eq!(nested.len(), 1);
+    let modules = analyzer.group_by_module(1000);
+
+    let mut needs_pub_super = HashSet::new();
+    let scope_uses = compute_parent_scope_items(
+        &nested,
+        &analyzer.use_statements,
+        &modules,
+        &mut needs_pub_super,
+        false,
+    );
+    let rendered = prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: scope_uses,
+    });
+    // The referenced file-scope import is kept; the unreferenced one pruned.
+    assert!(
+        rendered.contains("use std::collections::HashMap;"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("PathBuf"), "{rendered}");
+    // The private fn referenced via `super::` gets a binding + an upgrade.
+    assert!(
+        rendered.contains("use self::functions::top_helper;"),
+        "{rendered}"
+    );
+    assert!(needs_pub_super.contains("top_helper"));
+}
+
+#[test]
+fn macro_defining_module_gets_macro_use_and_first_position() {
+    let code = r#"
+        macro_rules! twice {
+            ($e:expr) => { $e + $e };
+        }
+
+        pub fn use_it() -> u64 { twice!(21) }
+    "#;
+    let file = syn::parse_file(code).expect("parse");
+    let mut analyzer = FileAnalyzer::new(false, 500);
+    analyzer.set_source(code);
+    analyzer.analyze(&file);
+    let modules = analyzer.group_by_module(1000);
+    let mod_rs = splitrs::module_generator::generate_mod_rs(
+        &modules,
+        Path::new("/tmp/unused"),
+        None,
+        false,
+        &[],
+    )
+    .expect("generate_mod_rs");
+    assert!(mod_rs.contains("#[macro_use]\npub mod macros;"), "{mod_rs}");
+    let macros_pos = mod_rs.find("pub mod macros;").expect("macros decl");
+    let functions_pos = mod_rs.find("pub mod functions;").expect("functions decl");
+    assert!(
+        macros_pos < functions_pos,
+        "macro-defining module must be declared first:\n{mod_rs}"
+    );
+}
+
+/// Depth-2 fixture shared by the CLI facade / depth-guard tests: `deep` is
+/// itself over budget at `--max-lines 4`, so unrestricted runs descend twice.
+const DEPTH2_FIXTURE: &str = r#"
+pub mod outer {
+    /// Outer worker.
+    pub fn outer_fn() -> usize { deep::deep_fn() }
+    pub struct OuterThing {
+        pub id: usize,
+    }
+    impl OuterThing {
+        pub fn id(&self) -> usize { self.id }
+    }
+    pub mod deep {
+        pub struct DeepThing;
+        pub fn deep_fn() -> usize { 2 }
+        pub fn other_fn() -> usize { 3 }
+        pub fn third_fn() -> usize { 4 }
+    }
+}
+"#;
+
+fn run_depth2_cli(dir: &TempDir, extra: &[&str]) -> std::path::PathBuf {
+    let input = dir.path().join("lib_fixture.rs");
+    fs::write(&input, DEPTH2_FIXTURE).expect("write fixture");
+    let output = dir.path().join("out");
+    let cmd = Command::new(env!("CARGO_BIN_EXE_splitrs"))
+        .arg("-i")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--split-nested-mods")
+        .arg("true")
+        .arg("--max-lines")
+        .arg("4")
+        .args(extra)
+        .output()
+        .expect("run splitrs");
+    assert!(
+        cmd.status.success(),
+        "splitrs failed:\n{}\n{}",
+        String::from_utf8_lossy(&cmd.stdout),
+        String::from_utf8_lossy(&cmd.stderr)
+    );
+    output
+}
+
+#[test]
+fn cli_facade_named_lists_explicit_reexports() {
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_depth2_cli(&dir, &["--facade", "named"]);
+
+    let outer_mod = read(&output.join("outer").join("mod.rs"));
+    assert!(
+        !outer_mod.contains("::*;"),
+        "named facade must not glob:\n{outer_mod}"
+    );
+    assert!(
+        outer_mod.contains("pub use types::OuterThing;"),
+        "named facade must re-export public items explicitly:\n{outer_mod}"
+    );
+    // The descended grandchild is declared, never re-exported: items must
+    // stay reachable at their original `outer::deep::*` paths only.
+    assert!(outer_mod.contains("pub mod deep;"), "{outer_mod}");
+    assert!(!outer_mod.contains("pub use deep"), "{outer_mod}");
+    assert_all_files_parse(&output);
+}
+
+#[test]
+fn cli_facade_none_emits_declarations_only() {
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_depth2_cli(&dir, &["--facade", "none"]);
+
+    let outer_mod = read(&output.join("outer").join("mod.rs"));
+    assert!(
+        !outer_mod.contains("pub use"),
+        "facade none must not re-export anything:\n{outer_mod}"
+    );
+    assert!(outer_mod.contains("pub mod deep;"), "{outer_mod}");
+    assert_all_files_parse(&output);
+}
+
+#[test]
+fn cli_max_mod_depth_keeps_deeper_mods_opaque() {
+    // Unrestricted control run: depth 2 is reached.
+    let free = TempDir::new().expect("tempdir");
+    let free_out = run_depth2_cli(&free, &[]);
+    assert!(
+        free_out.join("outer").join("deep").join("mod.rs").exists(),
+        "control run must descend into outer/deep/"
+    );
+
+    // Guarded run: --max-mod-depth 1 descends into `outer` but must leave
+    // the over-budget `deep` as an opaque inline mod inside outer/*.rs.
+    let guarded = TempDir::new().expect("tempdir");
+    let out = run_depth2_cli(&guarded, &["--max-mod-depth", "1"]);
+    assert!(
+        !out.join("outer").join("deep").exists(),
+        "--max-mod-depth 1 must not create outer/deep/"
+    );
+    let mut inline_deep = false;
+    for entry in fs::read_dir(out.join("outer")).expect("read outer") {
+        let path = entry.expect("entry").path();
+        if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            inline_deep |= read(&path).contains("pub mod deep {");
+        }
+    }
+    assert!(
+        inline_deep,
+        "the depth-limited mod must survive as an inline `pub mod deep {{ ... }}`"
+    );
+    assert_all_files_parse(&out);
 }
 
 #[test]

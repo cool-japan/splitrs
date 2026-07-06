@@ -465,7 +465,7 @@ fn parent_rules_do_not_apply_at_top_level() {
     let code = r#"
         pub fn copy_file() -> bool { true }
     "#;
-    let rules = vec![TargetModule {
+    let rules = [TargetModule {
         name: "fs".to_string(),
         items: vec!["copy_*".to_string()],
         parent: Some("core".to_string()),

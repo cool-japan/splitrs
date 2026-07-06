@@ -34,14 +34,15 @@ use crate::config::{FacadeStyle, TargetModule};
 use crate::domain_router;
 use crate::file_analyzer::FileAnalyzer;
 use crate::module_generator::{
-    deepen_super_in_use_tree, extract_test_module_path, generate_mod_rs_ext,
-    generate_tests_rs_full, Module,
+    deepen_super_in_use, deepen_super_in_use_tree, extract_test_module_path, generate_mod_rs_ext,
+    generate_tests_rs_full, item_defined_ident, item_visibility, Module, RefVisitor,
 };
 use anyhow::{Context, Result};
 use proc_macro2::{Group, Ident, Punct, Spacing, TokenStream, TokenTree};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 /// Options threaded through the recursive planning of nested inline modules.
@@ -98,6 +99,9 @@ pub struct NestedModPlan {
     pub cross_module_imports: HashMap<String, HashMap<String, Vec<String>>>,
     /// struct -> fields upgraded to `pub(super)` for cross-module access.
     pub fields_need_pub_super: HashMap<String, HashSet<String>>,
+    /// `use` items recreating this level's scope bindings for the child
+    /// directory modules (grandchildren) — emitted in this level's `mod.rs`.
+    pub scope_uses: Vec<syn::Item>,
 }
 
 impl NestedModPlan {
@@ -260,9 +264,21 @@ pub fn plan_nested_split(
     // Cross-module visibility fixups (pub(super) upgrades + import map),
     // computed while the extracted tests are still on the analyzer so the
     // reserved `tests` import key is populated.
-    let (needs_pub_super, cross_module_imports, fields_need_pub_super) =
+    let (mut needs_pub_super, cross_module_imports, fields_need_pub_super) =
         analyzer.compute_cross_module_visibility(&modules);
     let extracted_tests = analyzer.take_extracted_tests();
+
+    // Grandchildren reference THIS level's scope through `super::` paths and
+    // forwarded globs; recreate the needed bindings in this level's mod.rs.
+    // No deepening: `x/mod.rs` IS the module `x`, the same scope depth the
+    // mod body had.
+    let scope_uses = compute_parent_scope_items(
+        &child_mods,
+        &analyzer.use_statements,
+        &modules,
+        &mut needs_pub_super,
+        false,
+    );
 
     Ok(NestedModPlan {
         name: mod_item.ident.to_string(),
@@ -277,6 +293,7 @@ pub fn plan_nested_split(
         needs_pub_super,
         cross_module_imports,
         fields_need_pub_super,
+        scope_uses,
     })
 }
 
@@ -368,6 +385,7 @@ pub fn write_plan(
         &plan.inner_attrs,
         &child_decls,
         facade,
+        &plan.scope_uses,
     )?;
     let mod_path = dir.join("mod.rs");
     fs::write(&mod_path, &mod_content)
@@ -459,6 +477,210 @@ pub fn add_child_mod_imports(modules: &mut [Module], child_names: &[String]) {
                 module.sibling_mod_imports.push(child.clone());
             }
         }
+    }
+}
+
+/// Recreate the parent-scope bindings that descended mod bodies depend on.
+///
+/// Inside an inline `mod x { ... }`, `use super::*;` and `super::name` paths
+/// resolved against the surrounding FILE scope. After the split that scope is
+/// the generated `mod.rs`, which by default holds only `pub use` re-exports
+/// of public items — private file-level `use` bindings (e.g.
+/// `use std::collections::HashMap;`) and private items would no longer
+/// resolve from inside `x/`. This computes the `use` items `mod.rs` must
+/// carry to restore the original resolution chain:
+///
+/// - the parent's own `use` statements, pruned to the names the nested
+///   bodies actually reference (a private `use` binding in a module IS
+///   visible to its descendants, so this widens nothing);
+/// - `use self::<module>::<name>;` bindings for non-`pub` items that moved
+///   into generated sibling modules but are referenced from the nested
+///   bodies; referenced private functions are additionally added to
+///   `needs_pub_super` so their definition site is upgraded.
+///
+/// `deepen` adds one `super` segment to the pruned parent `use`s for the
+/// in-place `--deepen-super` workflow (where `mod.rs` itself sits one level
+/// deeper than the original file did).
+pub fn compute_parent_scope_items(
+    nested_mods: &[syn::ItemMod],
+    use_statements: &[syn::Item],
+    modules: &[Module],
+    needs_pub_super: &mut HashSet<String>,
+    deepen: bool,
+) -> Vec<syn::Item> {
+    if nested_mods.is_empty() {
+        return Vec::new();
+    }
+
+    // Names the nested bodies may resolve at the parent scope: bare path
+    // roots (resolved through the body's `use super::*;`), the first
+    // non-`super` segment of `super::...` paths, attribute idents (derives),
+    // and `use super::<name>` heads — minus the names each body defines
+    // itself and path keywords.
+    let mut referenced: HashSet<String> = HashSet::new();
+    let mut method_calls: HashSet<String> = HashSet::new();
+    for mod_item in nested_mods {
+        let Some((_, body_items)) = &mod_item.content else {
+            continue;
+        };
+        let mut plain = RefVisitor::default();
+        let mut supers = SuperTargetCollector::default();
+        let mut defined: HashSet<String> = HashSet::new();
+        for item in body_items {
+            plain.visit_item(item);
+            supers.visit_item(item);
+            if let Some(name) = item_defined_ident(item) {
+                defined.insert(name);
+            }
+        }
+        method_calls.extend(plain.method_calls.iter().cloned());
+        let mut names: HashSet<String> = plain.path_roots;
+        names.extend(plain.attr_idents);
+        names.extend(supers.names);
+        for name in names {
+            if !defined.contains(&name) {
+                referenced.insert(name);
+            }
+        }
+    }
+    for keyword in ["super", "crate", "self", "Self"] {
+        referenced.remove(keyword);
+    }
+
+    let mut out: Vec<syn::Item> = Vec::new();
+
+    // 1. The parent's own use statements, pruned to what the bodies need.
+    for use_item in use_statements {
+        let Some(pruned) = Module::prune_unused_use(use_item, &referenced, &method_calls) else {
+            continue;
+        };
+        if deepen {
+            out.push(deepen_super_in_use(&pruned));
+        } else {
+            out.push(pruned);
+        }
+    }
+
+    // 2. Bindings for non-pub items relocated into generated modules.
+    let mut bound: HashSet<String> = HashSet::new();
+    for module in modules {
+        let mut push_binding = |module_name: &str, name: &str, bound: &mut HashSet<String>| {
+            if !bound.insert(name.to_string()) {
+                return;
+            }
+            if let Ok(item) =
+                syn::parse_str::<syn::Item>(&format!("use self::{}::{};", module_name, name))
+            {
+                out.push(item);
+            }
+        };
+        for type_info in &module.types {
+            if !referenced.contains(&type_info.name) {
+                continue;
+            }
+            if matches!(
+                item_visibility(&type_info.item),
+                Some(syn::Visibility::Public(_))
+            ) {
+                continue; // reachable through the facade re-exports
+            }
+            push_binding(&module.name, &type_info.name, &mut bound);
+        }
+        for item in &module.standalone_items {
+            if matches!(item, syn::Item::Macro(_)) {
+                continue; // macro_rules flow through #[macro_use] instead
+            }
+            let Some(name) = item_defined_ident(item) else {
+                continue;
+            };
+            if !referenced.contains(&name) {
+                continue;
+            }
+            if matches!(item_visibility(item), Some(syn::Visibility::Public(_))) {
+                continue;
+            }
+            if matches!(item, syn::Item::Fn(_)) {
+                // Private fns are upgraded at their definition site so the
+                // binding (and the callers behind it) can see them.
+                needs_pub_super.insert(name.clone());
+            }
+            push_binding(&module.name, &name, &mut bound);
+        }
+    }
+
+    out
+}
+
+/// Read-only visitor collecting, for every `super::...`-rooted path or use
+/// tree, the first non-`super` segment — the name that must resolve in the
+/// parent scope after the body moves one level down.
+#[derive(Default)]
+struct SuperTargetCollector {
+    names: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for SuperTargetCollector {
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.leading_colon.is_none() {
+            if let Some(first) = path.segments.first() {
+                if first.ident == "super" {
+                    if let Some(target) = path
+                        .segments
+                        .iter()
+                        .map(|segment| segment.ident.to_string())
+                        .find(|ident| ident != "super")
+                    {
+                        self.names.insert(target);
+                    }
+                }
+            }
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // Mirror RefVisitor's macro handling: paths inside macro bodies (e.g.
+        // `twice!(super::VALUE)`) matter for parent-scope resolution too.
+        let tokens = mac.tokens.clone();
+        if let Ok(exprs) = syn::parse::Parser::parse2(
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+            tokens.clone(),
+        ) {
+            for expr in &exprs {
+                self.visit_expr(expr);
+            }
+        } else if let Ok(expr) = syn::parse2::<syn::Expr>(tokens) {
+            self.visit_expr(&expr);
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        fn walk(tree: &syn::UseTree, seen_super: bool, names: &mut HashSet<String>) {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    if path.ident == "super" {
+                        walk(&path.tree, true, names);
+                    } else if seen_super {
+                        names.insert(path.ident.to_string());
+                    }
+                }
+                syn::UseTree::Name(name) if seen_super => {
+                    names.insert(name.ident.to_string());
+                }
+                syn::UseTree::Rename(rename) if seen_super => {
+                    names.insert(rename.ident.to_string());
+                }
+                syn::UseTree::Group(group) => {
+                    for tree in &group.items {
+                        walk(tree, seen_super, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&item.tree, false, &mut self.names);
+        syn::visit::visit_item_use(self, item);
     }
 }
 
