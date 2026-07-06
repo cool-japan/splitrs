@@ -1,6 +1,6 @@
 [package]
 name = "splitrs"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 authors = ["COOLJAPAN OU (Team KitaSan)"]
 description = "AST-based Rust refactoring tool with trait separation, config files, and intelligent module generation"
