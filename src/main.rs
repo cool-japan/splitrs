@@ -58,6 +58,7 @@
 mod array_splitter;
 mod config;
 mod dependency_analyzer;
+mod domain_router;
 mod error_recovery;
 mod field_access_tracker;
 mod file_analyzer;
@@ -70,7 +71,9 @@ mod method_analyzer;
 mod metrics_dashboard;
 mod module_generator;
 mod naming_strategy;
+mod nested_mod_splitter;
 mod scope_analyzer;
+mod source_map;
 mod test_generator;
 
 // The SMT oracle and its CLI live in the library crate; the binary consumes
@@ -88,15 +91,15 @@ mod test_module_splitter;
 mod trait_bound_analyzer;
 mod trait_method_tracker;
 mod workspace;
+mod workspace_mode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::Config;
 use file_analyzer::FileAnalyzer;
-use module_generator::{extract_test_module_path, generate_mod_rs};
-use std::collections::HashMap;
+use module_generator::extract_test_module_path;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use syn::{File, Item};
 
 /// Command-line arguments for the SplitRS refactoring tool
@@ -314,18 +317,57 @@ struct Args {
     /// `extended.rs`, `v3.rs`) instead of the default `types.rs`/`functions.rs`
     /// heuristic. See `Config::target_modules` for the schema.
     ///
+    /// Patterns support `Foo` (exact), `Foo*`, `*Foo`, `*foo*`, `a*b*c` and `*`.
+    /// Exact names that match nothing in the file are a hard error (with
+    /// near-miss suggestions). Optional per-rule keys: `parent = "core"`
+    /// (route inside a module descended by --split-nested-mods),
+    /// `pull_dependencies = true` (matched items seed dependency attraction),
+    /// `doc = "..."` (module //! header), `max_lines = N` (per-module budget
+    /// override). Top-level key `assign_unlisted = "heuristic" | "seeded"`
+    /// controls what happens to unlisted items.
+    ///
     /// Example spec:
     /// ```toml
-    /// [[target_modules]]
-    /// name = "extended"
-    /// items = ["FooExt*"]
+    /// assign_unlisted = "seeded"
     ///
     /// [[target_modules]]
-    /// name = "core"
-    /// items = ["*"]
+    /// name = "hash"
+    /// parent = "core"
+    /// items = ["*hash*", "Sha*"]
+    /// pull_dependencies = true
     /// ```
     #[arg(long, value_name = "TOML-FILE")]
     target_modules: Option<PathBuf>,
+
+    /// Descend into inline `mod x { ... }` blocks that exceed the line budget
+    ///
+    /// Each over-budget inline non-test module is split with the full pipeline
+    /// into an `x/` directory module (`x/mod.rs` plus per-topic files),
+    /// recursively, and declared in the parent `mod.rs` with its original
+    /// visibility, attributes and doc comments. `super::` paths inside moved
+    /// items are deepened by one level per descent so semantics are preserved.
+    ///
+    /// Uses `--max-lines` (or the config `max_lines`) as the descend
+    /// threshold. Overrides configuration file if specified.
+    #[arg(long)]
+    split_nested_mods: Option<bool>,
+
+    /// Recursion depth guard for --split-nested-mods (default: 8)
+    ///
+    /// Inline modules nested deeper than this many levels are left opaque.
+    /// Overrides configuration file if specified.
+    #[arg(long, value_name = "N")]
+    max_mod_depth: Option<usize>,
+
+    /// Re-export style in each generated mod.rs: glob | named | none
+    ///
+    /// Controls how historical `crate::x::Item` paths keep resolving:
+    /// `glob` emits `pub use module::*;` (today's style, default), `named`
+    /// emits explicit `pub use module::{Foo, bar};` lists (better rustdoc, no
+    /// glob shadowing), `none` emits declarations only for hand-curated
+    /// re-exports. Overrides the configuration file (`[output] facade`).
+    #[arg(long, value_name = "STYLE")]
+    facade: Option<String>,
 
     /// Prove two pure fixed-width-integer functions semantically equivalent (SMT)
     ///
@@ -460,7 +502,7 @@ fn main() -> Result<()> {
 
     // Handle workspace mode
     if args.workspace {
-        return run_workspace_mode(&args);
+        return workspace_mode::run_workspace_mode(&args);
     }
 
     // For the standard pipeline, --input and --output are required.
@@ -527,6 +569,11 @@ fn main() -> Result<()> {
 
     // Merge command-line arguments with configuration
     config.merge_with_args(args.max_lines, args.max_impl_lines, args.split_impl_blocks);
+    config.merge_nested_args(
+        args.split_nested_mods,
+        args.max_mod_depth,
+        args.facade.as_deref(),
+    );
 
     // --extract-tests CLI flag overrides config when set
     if args.extract_tests {
@@ -535,7 +582,8 @@ fn main() -> Result<()> {
 
     // --target-modules CLI flag loads a standalone TOML file whose
     // [[target_modules]] entries augment any embedded ones from the main
-    // config. Standalone-file rules take precedence and are evaluated first.
+    // config. Standalone-file rules take precedence and are evaluated first;
+    // the file's `assign_unlisted` (if set) overrides the embedded one.
     if let Some(tm_path) = &args.target_modules {
         let spec = config::TargetModulesFile::from_file(tm_path).context(format!(
             "Failed to load target-modules configuration from {:?}\n\
@@ -548,6 +596,36 @@ fn main() -> Result<()> {
         let mut merged = spec.target_modules;
         merged.append(&mut config.target_modules);
         config.target_modules = merged;
+        if spec.assign_unlisted.is_some() {
+            config.assign_unlisted = spec.assign_unlisted;
+        }
+    }
+
+    // Effective Feature C / F2 settings.
+    let split_nested_mods = config.splitrs.split_nested_mods;
+    let max_mod_depth = config.splitrs.max_mod_depth.max(1);
+    let facade = config::FacadeStyle::parse(&config.output.facade)?;
+    let assign_unlisted = config::AssignUnlisted::parse(config.assign_unlisted.as_deref())?;
+    let seeded = assign_unlisted == config::AssignUnlisted::Seeded;
+
+    // Validate the merged rule list before doing any work: duplicate names,
+    // empty item lists and dead rules behind a `*` catch-all are hard errors.
+    config::validate_target_modules(&config.target_modules)?;
+
+    // Rules with `parent = "..."` route items inside a module descended by
+    // --split-nested-mods; they are dead without that mode.
+    let all_rules = config.target_modules.clone();
+    let top_rules: Vec<config::TargetModule> = all_rules
+        .iter()
+        .filter(|rule| rule.parent.is_none())
+        .cloned()
+        .collect();
+    if !split_nested_mods && all_rules.iter().any(|rule| rule.parent.is_some()) {
+        anyhow::bail!(
+            "[[target_modules]] rules with `parent = ...` route items inside nested inline \
+             modules and require --split-nested-mods (or `split_nested_mods = true` in \
+             .splitrs.toml)"
+        );
     }
 
     println!("Configuration loaded:");
@@ -557,8 +635,17 @@ fn main() -> Result<()> {
     if config.splitrs.extract_tests {
         println!("  Extract inline test mods: true");
     }
+    if split_nested_mods {
+        println!(
+            "  Split nested mods: true (max depth {}, facade {:?})",
+            max_mod_depth, config.output.facade
+        );
+    }
     if !config.target_modules.is_empty() {
         println!("  Target modules: {} rule(s)", config.target_modules.len());
+        if seeded {
+            println!("  Assign unlisted items: seeded");
+        }
     }
 
     // Read and parse the input file
@@ -620,8 +707,17 @@ fn main() -> Result<()> {
         config.splitrs.max_impl_lines,
     );
     analyzer.set_extract_tests(config.splitrs.extract_tests);
-    analyzer.set_target_modules(config.target_modules.clone());
+    analyzer.set_target_modules(top_rules.clone());
+    analyzer.set_seeded_assignment(seeded);
+    if split_nested_mods {
+        analyzer.set_split_nested_mods(true, config.splitrs.max_lines);
+    }
+    analyzer.set_source(&source_code);
     analyzer.analyze_with_test_files(&syntax_tree, input);
+
+    // F2: exact (non-glob) rule items that name nothing in this scope are a
+    // hard error with near-miss suggestions.
+    domain_router::check_unmatched_patterns(&domain_router::routable_names(&analyzer), &top_rules)?;
 
     println!("Found {} types", analyzer.types.len());
     println!("Found {} standalone items", analyzer.standalone_items.len());
@@ -632,8 +728,54 @@ fn main() -> Result<()> {
         println!("Found {} trait implementations", total_trait_impls);
     }
 
+    // Feature C: plan the recursive split of every diverted inline module.
+    // Planning is side-effect free so --dry-run can preview the full tree.
+    let nested_mods = analyzer.take_nested_mods();
+    let mut nested_plans: Vec<nested_mod_splitter::NestedModPlan> = Vec::new();
+    if !nested_mods.is_empty() {
+        let opts = nested_mod_splitter::NestedSplitOptions {
+            split_impl_blocks: config.splitrs.split_impl_blocks,
+            max_impl_lines: config.splitrs.max_impl_lines,
+            max_lines: config.splitrs.max_lines,
+            extract_tests: config.splitrs.extract_tests,
+            max_mod_depth,
+            seeded_assignment: seeded,
+            all_rules: &all_rules,
+        };
+        for nested in &nested_mods {
+            let mod_path = nested.ident.to_string();
+            nested_plans.push(nested_mod_splitter::plan_nested_split(
+                nested,
+                &source_code,
+                &opts,
+                &mod_path,
+                1,
+            )?);
+        }
+        println!("Descending into {} nested module(s)", nested_plans.len());
+    }
+    // Every `parent = "..."` rule must have found its descended module.
+    nested_mod_splitter::validate_parent_rules(&all_rules, &nested_plans)?;
+    if nested_plans.iter().any(|plan| plan.name == "tests") && !analyzer.extracted_tests.is_empty()
+    {
+        anyhow::bail!(
+            "a nested module named `tests` conflicts with the tests.rs produced by \
+             --extract-tests; re-run without --extract-tests or rename the module"
+        );
+    }
+
     // Group into modules
     let mut modules = analyzer.group_by_module(config.splitrs.max_lines);
+    if !nested_plans.is_empty() {
+        // Generated bucket names must yield to real child module names, and
+        // sibling files referencing a child mod by bare path (`core::init()`)
+        // need a `use super::core;` import.
+        let reserved: std::collections::HashSet<String> =
+            nested_plans.iter().map(|plan| plan.name.clone()).collect();
+        nested_mod_splitter::rename_module_collisions(&mut modules, &reserved);
+        let child_names: Vec<String> = nested_plans.iter().map(|plan| plan.name.clone()).collect();
+        nested_mod_splitter::add_child_mod_imports(&mut modules, &child_names);
+    }
     // When splitting a leaf sub-module in place into a same-named directory,
     // generated modules sit one level deeper, so inherited `super::` imports
     // must be deepened by one segment.
@@ -699,10 +841,43 @@ fn main() -> Result<()> {
             println!();
         }
 
+        // F2 transparency: per named module, attribute every item to the rule
+        // pattern that routed it (or mark it as pulled in by seeding).
+        if !top_rules.is_empty() {
+            let mut printed_header = false;
+            for module in &modules {
+                let Some(lines) = domain_router::explain_named_module(module, &top_rules) else {
+                    continue;
+                };
+                if !printed_header {
+                    println!("\n🧭 Rule attribution (named modules):");
+                    printed_header = true;
+                }
+                println!("  📄 {}.rs", module.name);
+                for line in lines {
+                    println!("    - {}", line);
+                }
+            }
+        }
+
+        if !nested_plans.is_empty() {
+            println!("\n📁 Nested module tree (--split-nested-mods):");
+            for plan in &nested_plans {
+                for line in nested_mod_splitter::dry_run_lines(plan, 1) {
+                    println!("{}", line);
+                }
+            }
+        }
+
         println!("\n💾 Files that would be created:");
         println!("  📁 {}/", output.display());
         for module in &modules {
             println!("    📄 {}.rs", module.name);
+        }
+        for plan in &nested_plans {
+            for line in nested_mod_splitter::dry_run_lines(plan, 2) {
+                println!("{}", line);
+            }
         }
         println!("    📄 mod.rs");
 
@@ -793,8 +968,19 @@ fn main() -> Result<()> {
     }
 
     // Compute which private functions and fields need pub(super) visibility for cross-module access
-    let (needs_pub_super, cross_module_imports, fields_need_pub_super) =
+    let (mut needs_pub_super, cross_module_imports, fields_need_pub_super) =
         analyzer.compute_cross_module_visibility(&modules);
+    // Feature C: descended mod bodies resolved names through the original
+    // file scope (`use super::*;` chains, `super::name` paths). Recreate the
+    // needed bindings in mod.rs and upgrade referenced private functions.
+    let scope_uses = nested_mod_splitter::compute_parent_scope_items(
+        &nested_mods,
+        &analyzer.use_statements,
+        &modules,
+        &mut needs_pub_super,
+        args.deepen_super,
+    );
+    let needs_pub_super = needs_pub_super;
     if !needs_pub_super.is_empty() {
         println!(
             "Upgrading {} private functions to pub(super) for cross-module access",
@@ -859,6 +1045,15 @@ fn main() -> Result<()> {
         created_count += 1;
     }
 
+    // Feature C: write each planned nested module tree under the output dir.
+    for plan in &nested_plans {
+        let files = nested_mod_splitter::write_plan(plan, output, facade)?;
+        for file in &files {
+            println!("Created: {:?}", file);
+        }
+        created_count += files.len();
+    }
+
     // Write tests.rs when --extract-tests produced inline test modules.
     // This must happen before mod.rs generation so we know whether to add
     // `#[cfg(test)] mod tests;` to mod.rs.
@@ -911,12 +1106,18 @@ fn main() -> Result<()> {
     let lib_rs_path = output.join("lib.rs");
     if !lib_rs_path.exists() {
         let test_module_path = extract_test_module_path(&syntax_tree);
-        let mod_content = generate_mod_rs(
+        let child_decls: Vec<syn::ItemMod> =
+            nested_plans.iter().map(|plan| plan.decl_item()).collect();
+        let mod_content = module_generator::generate_mod_rs_ext(
             &modules,
             output,
             test_module_path.as_deref(),
             has_extracted_tests,
             &analyzer.file_inner_docs,
+            &[],
+            &child_decls,
+            facade,
+            &scope_uses,
         )?;
         let mod_path = output.join("mod.rs");
         fs::write(&mod_path, &mod_content).context(format!(
@@ -934,6 +1135,17 @@ fn main() -> Result<()> {
         }
 
         println!("Created: {:?}", mod_path);
+    } else if !nested_plans.is_empty() {
+        eprintln!(
+            "Note: {} exists, so no mod.rs was written. Declare the descended module(s) there \
+             manually: {}",
+            lib_rs_path.display(),
+            nested_plans
+                .iter()
+                .map(|plan| format!("`mod {};`", plan.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // Remove the original input file when splitting a leaf sub-module *in place*
@@ -1191,226 +1403,6 @@ fn print_verify_report(
          name-resolution/visibility safety is the Rust compiler's responsibility \
          (verify with `cargo check`), NOT proven by SMT."
     );
-}
-
-/// Run SplitRS in workspace mode
-///
-/// Analyzes an entire Cargo workspace and identifies files that exceed
-/// the target line limit for refactoring.
-fn run_workspace_mode(args: &Args) -> Result<()> {
-    use rayon::prelude::*;
-    use workspace::{ParallelProcessor, WorkspaceAnalyzer};
-
-    println!("📦 SplitRS Workspace Mode");
-    println!("{}", "=".repeat(60));
-
-    // Configure parallel processing if enabled
-    if args.parallel {
-        let processor = ParallelProcessor::new(args.threads);
-        processor.configure_pool()?;
-        if args.threads > 0 {
-            println!("  Parallel processing: {} threads", args.threads);
-        } else {
-            println!("  Parallel processing: auto (all available cores)");
-        }
-    }
-
-    // Analyze the workspace
-    let ws_input = args
-        .input
-        .as_deref()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let analyzer = WorkspaceAnalyzer::new(ws_input, args.target);
-    let analysis = analyzer.analyze()?;
-
-    // Print summary
-    analyzer.print_summary(&analysis);
-
-    if args.dry_run {
-        println!("\n{}", "=".repeat(60));
-        println!("DRY RUN - No changes made");
-        println!("{}", "=".repeat(60));
-        return Ok(());
-    }
-
-    // Process files that need refactoring
-    if analysis.files_to_refactor.is_empty() {
-        println!("\n✅ No files need refactoring");
-        return Ok(());
-    }
-
-    println!(
-        "\n🔧 Processing {} files...",
-        analysis.files_to_refactor.len()
-    );
-
-    // Initialize error recovery if enabled
-    let rollback_manager = error_recovery::RollbackManager::new(args.rollback);
-    let mut error_collector =
-        error_recovery::ErrorCollector::new().with_continue_on_error(args.continue_on_error);
-
-    let mut processed = 0;
-    let mut failed = 0;
-
-    let ws_output = args
-        .output
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    // Process files (in parallel if enabled)
-    let results: Vec<_> = if args.parallel {
-        analysis
-            .files_to_refactor
-            .par_iter()
-            .map(|file_info| {
-                process_workspace_file(
-                    &file_info.path,
-                    &ws_output,
-                    args.max_lines.unwrap_or(args.target),
-                    args.continue_on_error,
-                )
-            })
-            .collect()
-    } else {
-        analysis
-            .files_to_refactor
-            .iter()
-            .map(|file_info| {
-                process_workspace_file(
-                    &file_info.path,
-                    &ws_output,
-                    args.max_lines.unwrap_or(args.target),
-                    args.continue_on_error,
-                )
-            })
-            .collect()
-    };
-
-    for result in results {
-        match result {
-            Ok(path) => {
-                println!("  ✅ Processed: {:?}", path);
-                processed += 1;
-            }
-            Err(e) => {
-                let error = error_recovery::DiagnosticError::new(
-                    e.to_string(),
-                    error_recovery::ErrorSeverity::Error,
-                );
-                let should_continue = error_collector.add(error);
-
-                failed += 1;
-
-                if !should_continue {
-                    eprintln!("  ❌ Too many errors, stopping...");
-                    if args.rollback {
-                        eprintln!("  🔄 Rolling back changes...");
-                        rollback_manager.rollback()?;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    // Print summary
-    println!("\n📊 Workspace Refactoring Summary");
-    println!("{}", "=".repeat(60));
-    println!("  Files processed: {}", processed);
-    println!("  Files failed: {}", failed);
-
-    if error_collector.has_errors() {
-        println!("\n⚠️  Errors encountered:");
-        print!("{}", error_collector.format_all());
-    }
-
-    if args.rollback && failed > 0 {
-        println!("\n🔄 Some files failed. Use --rollback to restore original files.");
-    }
-
-    Ok(())
-}
-
-/// Process a single file in workspace mode
-fn process_workspace_file(
-    input: &Path,
-    output_base: &Path,
-    max_lines: usize,
-    _continue_on_error: bool,
-) -> Result<PathBuf> {
-    // Create output directory based on input file location
-    let file_stem = input
-        .file_stem()
-        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
-
-    let output = output_base.join(file_stem);
-    fs::create_dir_all(&output)?;
-
-    // Read and parse the file
-    let source_code = fs::read_to_string(input)?;
-    let syntax_tree = syn::parse_file(&source_code)?;
-
-    // Analyze the file (including any referenced test files)
-    let mut analyzer = FileAnalyzer::new(true, max_lines / 2);
-    analyzer.analyze_with_test_files(&syntax_tree, input);
-
-    // Group into modules
-    let modules = analyzer.group_by_module(max_lines);
-
-    // Build type-to-module mapping for super:: imports
-    let mut type_to_module: HashMap<String, String> = HashMap::new();
-    for module in &modules {
-        for exported_type in module.get_exported_types() {
-            type_to_module.insert(exported_type, module.name.clone());
-        }
-    }
-
-    // Register trait definitions with their modules for trait method import tracking
-    for module in &modules {
-        for item in &module.standalone_items {
-            if let Item::Trait(trait_item) = item {
-                let trait_name = trait_item.ident.to_string();
-                analyzer
-                    .trait_tracker
-                    .register_trait_module(&trait_name, &module.name);
-            }
-        }
-    }
-
-    // Compute cross-module visibility requirements
-    let (needs_pub_super, cross_module_imports, fields_need_pub_super) =
-        analyzer.compute_cross_module_visibility(&modules);
-
-    // Write modules
-    for module in &modules {
-        let module_path = output.join(format!("{}.rs", module.name));
-        let content = module.generate_content(
-            &syntax_tree,
-            &analyzer.use_statements,
-            &type_to_module,
-            &needs_pub_super,
-            cross_module_imports.get(&module.name),
-            &fields_need_pub_super,
-            Some(&analyzer.trait_tracker),
-        );
-        fs::write(&module_path, &content)?;
-    }
-
-    // Write mod.rs only when lib.rs does NOT exist in the output directory.
-    // When splitting a crate's src/ directory, lib.rs is the entry point and
-    // we must not overwrite or shadow it with a mod.rs.
-    let lib_rs_check = output.join("lib.rs");
-    if !lib_rs_check.exists() {
-        let test_module_path = extract_test_module_path(&syntax_tree);
-        let mod_rs_path = output.join("mod.rs");
-        // Workspace mode does not currently support --extract-tests, so
-        // pass `false` for the inline-tests flag.
-        let mod_content =
-            generate_mod_rs(&modules, &output, test_module_path.as_deref(), false, &[])?;
-        fs::write(&mod_rs_path, &mod_content)?;
-    }
-
-    Ok(output)
 }
 
 #[cfg(test)]

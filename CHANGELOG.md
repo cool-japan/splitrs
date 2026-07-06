@@ -5,6 +5,30 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-07-06
+
+### Added
+- **Domain-mapping for `--target-modules`** (`src/domain_router.rs`): seeded assignment (`assign_unlisted = "seeded"` / per-rule `pull_dependencies = true`) pulls items not matched by any rule into the named module with the strongest reference affinity, iterated to a fixpoint; zero-affinity items still fall back to the classic heuristic buckets
+- Unknown-name validation for `[[target_modules]]`: an exact (non-glob) `items` pattern that names nothing in the file is now a hard error, with near-miss suggestions
+- Dry-run attribution for `--target-modules`: reports which rule (or seed edge) pulled each item into a named module
+- Extended `[[target_modules]]` schema: `parent` (route inside a module descended by `--split-nested-mods`), `pull_dependencies`, `doc` (custom `//!` header for the generated module), and per-rule `max_lines` (module overflows into `<name>_2.rs`, `<name>_3.rs`, ... when exceeded)
+- Top-level `assign_unlisted = "heuristic" | "seeded"` config/spec-file key
+- Infix (`*foo*`) and multi-segment (`a*b*c`) glob patterns for `[[target_modules]]` item matching, in addition to the existing exact/prefix/suffix forms
+- `validate_target_modules()`: rejects duplicate module names within the same `parent` scope, rules with an empty `items` list, and catch-all `*` rules that aren't the last rule in their scope
+- **Nested inline-mod descent** (`--split-nested-mods`, `--max-mod-depth`, `src/nested_mod_splitter.rs`): recursively splits over-budget inline `mod x { ... }` bodies through the same analyze → group → generate pipeline, emitting `<output>/x/mod.rs` recursively; `super::` paths are depth-adjusted per descent level and absolute spans are preserved so verbatim emission keeps working
+- `--facade <glob|named|none>` flag / `[output] facade` config option controlling the re-export style of generated `mod.rs` facades (glob `pub use x::*;`, explicit named re-exports, or declarations only)
+- **Verbatim source slicing** (`src/source_map.rs`, public `SourceMap`): maps `proc_macro2::Span` back to exact original source byte ranges so split items — and now also individual extracted impl methods — are emitted byte-for-byte, preserving inline comments and formatting that `prettyplease` would otherwise reflow away
+- New integration test suites: `tests/acceptance_e2e_tests.rs`, `tests/domain_mapping_tests.rs`, `tests/nested_mod_tests.rs`
+
+### Changed
+- `run_workspace_mode` (`--workspace`) extracted out of `main.rs` into its own bin-only module, `src/workspace_mode.rs`
+- `method_analyzer::MethodInfo` gained a `verbatim` field; `ImplBlockAnalyzer::analyze`/`analyze_method` now accept the original source so extracted methods can be emitted verbatim
+- `module_generator` extended with `generate_mod_rs_ext`, `item_defined_ident`, `item_visibility`, `deepen_super_in_use`/`deepen_super_in_use_tree`, `public_export_names`, `local_item_names`, `analyze_references`, and `prune_unused_use` to support nested-mod descent and domain routing
+- `tests/extract_and_target_tests.rs` extended with additional coverage
+- `syn` gained the `visit-mut` feature; added `proc-macro2 = { version = "1", features = ["span-locations"] }` (needed by `source_map.rs`)
+- `tokio` updated from 1.52.1 to 1.52.3
+- `dashmap` updated from 6.1.0 to 6.2.1
+
 ## [0.3.2] - 2026-06-09
 
 ### Added

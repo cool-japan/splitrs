@@ -115,7 +115,7 @@ pub(super) fn std_prelude_names() -> &'static [&'static str] {
 /// name can be referenced as a path-root elsewhere (structs, enums, fns,
 /// consts, statics, type aliases, traits, unions, and macro definitions). Items
 /// without a single defining ident (impls, use, extern blocks) return `None`.
-pub(super) fn item_defined_ident(item: &Item) -> Option<String> {
+pub(crate) fn item_defined_ident(item: &Item) -> Option<String> {
     let ident = match item {
         Item::Struct(i) => &i.ident,
         Item::Enum(i) => &i.ident,
@@ -144,7 +144,7 @@ pub(crate) fn deepen_super_in_use(use_item: &Item) -> Item {
     Item::Use(u)
 }
 /// Prepend a `super::` segment to a `UseTree` whose head identifier is `super`.
-fn deepen_super_in_use_tree(tree: &mut syn::UseTree) {
+pub(crate) fn deepen_super_in_use_tree(tree: &mut syn::UseTree) {
     use syn::UseTree;
     if let UseTree::Path(p) = tree {
         if p.ident == "super" {
@@ -231,7 +231,7 @@ fn is_pascal_case(name: &str) -> bool {
 /// Used to decide whether a `pub use module::*;` re-export would actually
 /// expose anything. Items that are not nameable (impls, use statements, etc.)
 /// return `None`.
-pub(super) fn item_visibility(item: &Item) -> Option<&syn::Visibility> {
+pub(crate) fn item_visibility(item: &Item) -> Option<&syn::Visibility> {
     match item {
         Item::Fn(f) => Some(&f.vis),
         Item::Const(c) => Some(&c.vis),
@@ -451,11 +451,60 @@ pub(super) fn apply_specific_field_visibility(
 /// The content of `mod.rs` as a string
 pub fn generate_mod_rs(
     modules: &[Module],
-    _output_dir: &Path,
+    output_dir: &Path,
     test_module_path: Option<&str>,
     has_extracted_tests: bool,
     file_inner_docs: &[syn::Attribute],
 ) -> Result<String> {
+    generate_mod_rs_ext(
+        modules,
+        output_dir,
+        test_module_path,
+        has_extracted_tests,
+        file_inner_docs,
+        &[],
+        &[],
+        crate::config::FacadeStyle::Glob,
+        &[],
+    )
+}
+
+/// Extended `mod.rs` generator (Feature C).
+///
+/// In addition to everything [`generate_mod_rs`] does, this:
+///
+/// - emits non-doc *inner* attributes (`#![allow(...)]`, ...) carried over
+///   from an inline module body (`file_inner_attrs`);
+/// - emits `scope_uses` — `use` items that recreate the original file-scope
+///   bindings the descended child modules resolve through (`use super::*;`
+///   chains and `super::name` paths from inside a moved mod body land here);
+/// - declares each descended child directory module (`child_mods`, given as
+///   declaration-form `syn::ItemMod`s — `content: None` — so the original
+///   visibility, `#[cfg]` attributes and `///` doc comments are preserved
+///   exactly); child mods get *no* re-export: their items must stay at
+///   `...::<child>::Item`, exactly where they were before the split;
+/// - renders the re-export facade for the generated modules according to
+///   `facade` (`glob` — today's `pub use m::*;` style, `named` — explicit
+///   `pub use m::{A, b};` lists, or `none`).
+///
+/// Modules that define `macro_rules!` macros are declared FIRST and carry
+/// `#[macro_use]`, so their macros stay textually visible to every other
+/// generated module and to the child directory modules (macro_rules scoping
+/// is textual and ordered).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_mod_rs_ext(
+    modules: &[Module],
+    _output_dir: &Path,
+    test_module_path: Option<&str>,
+    has_extracted_tests: bool,
+    file_inner_docs: &[syn::Attribute],
+    file_inner_attrs: &[syn::Attribute],
+    child_mods: &[syn::ItemMod],
+    facade: crate::config::FacadeStyle,
+    scope_uses: &[Item],
+) -> Result<String> {
+    use crate::config::FacadeStyle;
+
     let mut content = String::new();
     for attr in file_inner_docs {
         if let syn::Meta::NameValue(nv) = &attr.meta {
@@ -480,14 +529,85 @@ pub fn generate_mod_rs(
     } else {
         content.push('\n');
     }
-    for module in modules {
+    // Non-doc inner attributes from the original module body (e.g.
+    // `#![allow(dead_code)]`) keep applying to the whole directory module.
+    if !file_inner_attrs.is_empty() {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: file_inner_attrs.to_vec(),
+            items: Vec::new(),
+        });
+        content.push_str(&rendered);
+        content.push('\n');
+    }
+    // Recreate the original file-scope `use` bindings that descended child
+    // modules resolve through (they reference this scope via `super::` paths
+    // and forwarded `use super::*;` globs). Private `use` bindings in a
+    // module ARE visible to its descendants, so this restores the original
+    // resolution chain without widening the public API.
+    if !scope_uses.is_empty() {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: scope_uses.to_vec(),
+        });
+        content.push_str(&rendered);
+        content.push('\n');
+    }
+    // `macro_rules!` scoping is textual and ordered: modules that define
+    // macros are declared first and carry `#[macro_use]` so their macros are
+    // visible in every later sibling module and in the child directory mods.
+    let defines_macro = |module: &Module| {
+        module
+            .standalone_items
+            .iter()
+            .any(|item| matches!(item, Item::Macro(m) if m.ident.is_some()))
+    };
+    for module in modules.iter().filter(|m| defines_macro(m)) {
+        content.push_str(&format!("#[macro_use]\npub mod {};\n", module.name));
+    }
+    for module in modules.iter().filter(|m| !defines_macro(m)) {
         content.push_str(&format!("pub mod {};\n", module.name));
     }
-    content.push_str("\n// Re-export all types\n");
-    for module in modules {
-        if module.has_public_reexport() {
-            content.push_str(&format!("pub use {}::*;\n", module.name));
+    // Child directory modules (descended nested mods). Rendering the
+    // declaration-form ItemMod through prettyplease preserves attributes,
+    // `///` docs, and the original visibility (`pub`, `pub(crate)`, private).
+    for child in child_mods {
+        let rendered = prettyplease::unparse(&File {
+            shebang: None,
+            attrs: Vec::new(),
+            items: vec![Item::Mod(child.clone())],
+        });
+        content.push_str(&rendered);
+    }
+    match facade {
+        FacadeStyle::Glob => {
+            content.push_str("\n// Re-export all types\n");
+            for module in modules {
+                if module.has_public_reexport() {
+                    content.push_str(&format!("pub use {}::*;\n", module.name));
+                }
+            }
         }
+        FacadeStyle::Named => {
+            content.push_str("\n// Re-export all types\n");
+            for module in modules {
+                let names = module.public_export_names();
+                if names.is_empty() {
+                    continue;
+                }
+                if names.len() == 1 {
+                    content.push_str(&format!("pub use {}::{};\n", module.name, names[0]));
+                } else {
+                    content.push_str(&format!(
+                        "pub use {}::{{{}}};\n",
+                        module.name,
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        FacadeStyle::None => {}
     }
     if let Some(test_path) = test_module_path {
         content.push_str("\n#[cfg(test)]\n");
@@ -633,9 +753,13 @@ pub fn generate_tests_rs_full(
     for name in std_prelude_names() {
         resolved.insert(name.to_string());
     }
-    let needs_glob = refs.path_roots.iter().any(|name| {
-        name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
-    });
+    let needs_glob = refs
+        .path_roots
+        .iter()
+        .chain(refs.attr_idents.iter())
+        .any(|name| {
+            name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
+        });
     let mut kept: Vec<Item> = explicit_uses;
     if needs_glob {
         kept.append(&mut glob_uses);

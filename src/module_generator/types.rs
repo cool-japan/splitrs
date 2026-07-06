@@ -33,6 +33,11 @@ pub struct Module {
     pub types: Vec<TypeInfo>,
     /// Standalone items (functions, constants, etc.)
     pub standalone_items: Vec<Item>,
+    /// Byte-faithful verbatim source text for each entry in `standalone_items`,
+    /// index-aligned (`standalone_verbatim[i]` corresponds to `standalone_items[i]`).
+    /// `None` for an item means no faithful slice is available (no source, or an
+    /// exotic routing site) and emission must fall back to prettyplease for it.
+    pub standalone_verbatim: Vec<Option<String>>,
     /// Type name for impl block splitting
     ///
     /// When this module contains split impl block methods, this field
@@ -52,6 +57,11 @@ pub struct Module {
     ///
     /// Preserves attributes like `#[cfg]`, `#[allow]`, etc. from the original impl block.
     pub impl_attrs: Vec<syn::Attribute>,
+    /// Byte-faithful verbatim text of the original `impl ... {` header line for
+    /// split-impl modules (preserves attributes/formatting). When present and all
+    /// methods carry `verbatim`, the impl block is emitted verbatim; otherwise
+    /// emission falls back to prettyplease.
+    pub impl_header_verbatim: Option<String>,
     /// Method group for split impl blocks
     ///
     /// When this module contains split impl block methods, this field
@@ -77,6 +87,16 @@ pub struct Module {
     /// extra `super` segment, because the moved code now sits one module level
     /// deeper. Defaults to `false`, preserving classic flat-output behaviour.
     pub deepen_super: bool,
+    /// Custom module documentation (F2 per-rule `doc = "..."`).
+    ///
+    /// When set, emitted as the generated file's `//!` header instead of the
+    /// generic template. Multi-line strings become multiple `//!` lines.
+    pub module_doc: Option<String>,
+    /// Names of sibling directory modules (nested inline mods descended by
+    /// Feature C) that this module's items reference by bare path (e.g. a
+    /// call to `core::init()` when `mod core` became `core/`). Emitted as
+    /// `use super::<name>;` so those paths keep resolving after the split.
+    pub sibling_mod_imports: Vec<String>,
 }
 impl Module {
     /// Creates a new empty module with the given name
@@ -85,15 +105,19 @@ impl Module {
             name,
             types: Vec::new(),
             standalone_items: Vec::new(),
+            standalone_verbatim: Vec::new(),
             impl_type_name: None,
             impl_self_ty: None,
             impl_generics: None,
             impl_attrs: Vec::new(),
+            impl_header_verbatim: None,
             method_group: None,
             field_visibility: None,
             type_name_for_traits: None,
             trait_impls: Vec::new(),
             deepen_super: false,
+            module_doc: None,
+            sibling_mod_imports: Vec::new(),
         }
     }
     /// Get the types exported by this module
@@ -147,6 +171,30 @@ impl Module {
         self.standalone_items
             .iter()
             .any(|item| matches!(item_visibility(item), Some(syn::Visibility::Public(_))))
+    }
+    /// Names of the `pub` items this module defines — the set an explicit
+    /// (`--facade named`) re-export list must cover so historical
+    /// `crate::x::Item` paths keep resolving. Sorted and deduplicated.
+    pub fn public_export_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for type_info in &self.types {
+            if matches!(
+                item_visibility(&type_info.item),
+                Some(syn::Visibility::Public(_))
+            ) {
+                names.push(type_info.name.clone());
+            }
+        }
+        for item in &self.standalone_items {
+            if matches!(item_visibility(item), Some(syn::Visibility::Public(_))) {
+                if let Some(ident) = item_defined_ident(item) {
+                    names.push(ident);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
     }
     /// Collect all symbols used in this module's items
     pub(super) fn collect_used_symbols(&self) -> HashSet<String> {
@@ -386,7 +434,7 @@ impl Module {
     /// module resolves on its own (its own type definitions, free functions,
     /// consts, etc.) versus which must come from an import. A name defined here
     /// never needs a glob to resolve it.
-    pub(super) fn local_item_names(&self) -> HashSet<String> {
+    pub(crate) fn local_item_names(&self) -> HashSet<String> {
         let mut names = HashSet::new();
         for type_info in &self.types {
             names.insert(type_info.name.clone());
@@ -406,7 +454,7 @@ impl Module {
     /// idents) that drives import pruning. Preferred over the textual
     /// [`rendered_code`](Self::rendered_code)-based probes because it is immune to
     /// doc-comment text and declaration-site identifiers.
-    pub(super) fn analyze_references(&self) -> RefVisitor {
+    pub(crate) fn analyze_references(&self) -> RefVisitor {
         let mut v = RefVisitor::default();
         for type_info in &self.types {
             v.visit_item(&type_info.item);
@@ -674,7 +722,7 @@ impl Module {
     /// grouped import is carried verbatim into a module that only needs a
     /// subset of its names, without dropping traits reachable only via method
     /// syntax.
-    pub(super) fn prune_unused_use(
+    pub(crate) fn prune_unused_use(
         use_item: &Item,
         used: &HashSet<String>,
         called_methods: &HashSet<String>,
@@ -774,7 +822,19 @@ impl Module {
         trait_tracker: Option<&TraitMethodTracker>,
     ) -> String {
         let mut content = String::new();
-        if let Some(type_name) = &self.type_name_for_traits {
+        if let Some(doc) = &self.module_doc {
+            for line in doc.lines() {
+                if line.trim().is_empty() {
+                    content.push_str("//!\n");
+                } else {
+                    content.push_str(&format!("//! {}\n", line));
+                }
+            }
+            content.push_str("//!\n");
+            content.push_str(
+                "//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)\n\n",
+            );
+        } else if let Some(type_name) = &self.type_name_for_traits {
             content.push_str(&format!(
                 "//! # `{}` - Trait Implementations\n//!\n",
                 type_name
@@ -857,9 +917,17 @@ impl Module {
         for name in std_prelude_names() {
             resolved.insert(name.to_string());
         }
-        let unresolved_types = refs.path_roots.iter().any(|name| {
-            name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
-        });
+        // Attribute idents (e.g. derive macros like `Serialize`) resolve
+        // through imports just like path roots do; a module whose ONLY
+        // unresolved names are derives (common for pure data-type modules)
+        // still needs the inherited glob.
+        let unresolved_types = refs
+            .path_roots
+            .iter()
+            .chain(refs.attr_idents.iter())
+            .any(|name| {
+                name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
+            });
         let all_referenced_resolved = !unresolved_types;
         let mut use_items: Vec<Item> = explicit_uses;
         if !all_referenced_resolved {
@@ -919,6 +987,15 @@ impl Module {
                 .push(type_name);
         }
         let mut has_super_imports = !imports_by_module.is_empty();
+        // Sibling directory modules (nested inline mods descended by Feature
+        // C) referenced by bare path from this module's items. `use
+        // super::<name>;` restores the original file-scope resolution of
+        // paths like `core::init()`. Siblings sit at the same level, so no
+        // deepening applies here (mirrors the sibling fn imports below).
+        for sibling in &self.sibling_mod_imports {
+            content.push_str(&format!("use super::{};\n", sibling));
+            has_super_imports = true;
+        }
         for (module_name, mut types) in imports_by_module {
             types.sort();
             types.dedup();
@@ -981,6 +1058,11 @@ impl Module {
         }
         if let Some(_type_name) = &self.type_name_for_traits {
             for trait_impl in &self.trait_impls {
+                if let Some(verbatim) = &trait_impl.verbatim {
+                    content.push_str(verbatim);
+                    content.push('\n');
+                    continue;
+                }
                 let formatted = prettyplease::unparse(&syn::File {
                     shebang: None,
                     attrs: Vec::new(),
@@ -1029,6 +1111,31 @@ impl Module {
         }
         if let Some(method_group) = &self.method_group {
             if let Some(type_name) = &self.impl_type_name {
+                // Prefer byte-faithful verbatim emission: the original `impl ... {`
+                // header + each method's exact source (inline `//` comments and
+                // formatting preserved), then a closing `}`. Fall back to the
+                // prettyplease rendering when any verbatim slice is unavailable,
+                // so output is never empty/broken.
+                let all_verbatim: Option<Vec<&str>> = method_group
+                    .methods
+                    .iter()
+                    .map(|m| m.verbatim.as_deref())
+                    .collect();
+                if let (Some(header), Some(bodies)) =
+                    (self.impl_header_verbatim.as_deref(), all_verbatim)
+                {
+                    content.push_str(header);
+                    content.push('\n');
+                    for body in bodies {
+                        content.push_str(body);
+                        // Methods are separated by a blank line for readability;
+                        // each `body` is the verbatim method (no trailing newline).
+                        content.push_str("\n\n");
+                    }
+                    content.push_str("}\n");
+                    return content;
+                }
+                // Fallback: synthesize and pretty-print (original behavior).
                 let mut impl_items = Vec::new();
                 for method in &method_group.methods {
                     impl_items.push(syn::ImplItem::Fn(method.item.clone()));
@@ -1124,11 +1231,7 @@ impl Module {
             );
             items.extend(type_info.trait_impls.iter().map(|ti| ti.impl_item.clone()));
         }
-        for item in &self.standalone_items {
-            let upgraded_item = upgrade_function_visibility(item.clone(), needs_pub_super);
-            let upgraded_item = upgrade_type_visibility(upgraded_item);
-            items.push(upgraded_item);
-        }
+        // Bulk type-derived items keep their existing prettyplease rendering.
         if !items.is_empty() {
             let formatted = prettyplease::unparse(&syn::File {
                 shebang: None,
@@ -1136,6 +1239,37 @@ impl Module {
                 items,
             });
             content.push_str(&formatted);
+        }
+        // Standalone items: emit byte-verbatim from original source when the
+        // visibility upgrade is a no-op (so the original bytes are faithful) and
+        // an aligned source slice exists; otherwise fall back to prettyplease for
+        // that single item, preserving the visibility-widening behavior.
+        let verbs_aligned = self.standalone_verbatim.len() == self.standalone_items.len();
+        debug_assert!(
+            verbs_aligned || self.standalone_verbatim.is_empty(),
+            "standalone_verbatim must be index-aligned with standalone_items"
+        );
+        for (idx, item) in self.standalone_items.iter().enumerate() {
+            let upgraded =
+                upgrade_type_visibility(upgrade_function_visibility(item.clone(), needs_pub_super));
+            let vis_unchanged =
+                render_vis(item_visibility(item)) == render_vis(item_visibility(&upgraded));
+            let verbatim = if verbs_aligned && vis_unchanged {
+                self.standalone_verbatim[idx].as_deref()
+            } else {
+                None
+            };
+            if let Some(text) = verbatim {
+                content.push_str(text);
+                content.push_str("\n\n");
+            } else {
+                let formatted = prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![upgraded],
+                });
+                content.push_str(&formatted);
+            }
         }
         content
     }
@@ -1162,4 +1296,12 @@ pub(crate) struct RefVisitor {
     pub(crate) path_roots: HashSet<String>,
     pub(crate) method_calls: HashSet<String>,
     pub(crate) attr_idents: HashSet<String>,
+}
+
+/// Render an optional visibility to a stable string for no-op comparison.
+/// `Inherited` (None or empty) renders empty; `pub(super)` renders non-empty,
+/// so a private→`pub(super)` upgrade is detected as a change.
+fn render_vis(opt: Option<&syn::Visibility>) -> String {
+    opt.map(|v| quote::quote!(#v).to_string())
+        .unwrap_or_default()
 }
