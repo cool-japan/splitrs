@@ -3,9 +3,7 @@
 //! unlisted items, spec validation, per-rule budgets/docs, and the F1 x F2
 //! composition (`parent = "core"`).
 
-use splitrs::config::{
-    matches_pattern, validate_target_modules, TargetModule, TargetModulesFile,
-};
+use splitrs::config::{matches_pattern, validate_target_modules, TargetModule, TargetModulesFile};
 use splitrs::domain_router::{check_unmatched_patterns, routable_names};
 use splitrs::file_analyzer::FileAnalyzer;
 use splitrs::module_generator::Module;
@@ -44,15 +42,12 @@ fn standalone_names(module: &Module) -> HashSet<String> {
 }
 
 fn find<'a>(modules: &'a [Module], name: &str) -> &'a Module {
-    modules
-        .iter()
-        .find(|m| m.name == name)
-        .unwrap_or_else(|| {
-            panic!(
-                "module `{name}` missing; have: {:?}",
-                modules.iter().map(|m| &m.name).collect::<Vec<_>>()
-            )
-        })
+    modules.iter().find(|m| m.name == name).unwrap_or_else(|| {
+        panic!(
+            "module `{name}` missing; have: {:?}",
+            modules.iter().map(|m| &m.name).collect::<Vec<_>>()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +183,10 @@ fn seeding_reaches_fixpoint_over_chains() {
     let modules = analyzer.group_by_module(500);
     let names = standalone_names(find(&modules, "chain"));
     assert!(names.contains("mid_b"), "{names:?}");
-    assert!(names.contains("leaf_c"), "fixpoint wave 2 missed: {names:?}");
+    assert!(
+        names.contains("leaf_c"),
+        "fixpoint wave 2 missed: {names:?}"
+    );
     // Zero-affinity items stay heuristic.
     let fn_names = standalone_names(find(&modules, "functions"));
     assert!(fn_names.contains("island"));
@@ -249,7 +247,11 @@ fn seeding_pulls_types_with_their_impls() {
         .iter()
         .find(|t| t.name == "MonitorConfig")
         .expect("MonitorConfig");
-    assert_eq!(cfg.impls.len(), 1, "inherent impl must travel with the type");
+    assert_eq!(
+        cfg.impls.len(),
+        1,
+        "inherent impl must travel with the type"
+    );
     assert_eq!(cfg.trait_impls.len(), 1, "trait impl must travel too");
     assert!(!type_names.contains("Unrelated"));
 }
@@ -274,7 +276,11 @@ fn seeded_grouping_is_deterministic() {
             })
             .collect()
     };
-    assert_eq!(run(), run(), "two identical runs must produce identical grouping");
+    assert_eq!(
+        run(),
+        run(),
+        "two identical runs must produce identical grouping"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +299,10 @@ fn unknown_exact_item_is_hard_error_with_suggestions() {
         .expect_err("unknown exact item must fail")
         .to_string();
     assert!(err.contains("compute_md6"), "{err}");
-    assert!(err.contains("compute_md5"), "no near-miss suggestion: {err}");
+    assert!(
+        err.contains("compute_md5"),
+        "no near-miss suggestion: {err}"
+    );
 }
 
 #[test]

@@ -722,7 +722,7 @@ impl Module {
     /// grouped import is carried verbatim into a module that only needs a
     /// subset of its names, without dropping traits reachable only via method
     /// syntax.
-    pub(super) fn prune_unused_use(
+    pub(crate) fn prune_unused_use(
         use_item: &Item,
         used: &HashSet<String>,
         called_methods: &HashSet<String>,
@@ -917,9 +917,17 @@ impl Module {
         for name in std_prelude_names() {
             resolved.insert(name.to_string());
         }
-        let unresolved_types = refs.path_roots.iter().any(|name| {
-            name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
-        });
+        // Attribute idents (e.g. derive macros like `Serialize`) resolve
+        // through imports just like path roots do; a module whose ONLY
+        // unresolved names are derives (common for pure data-type modules)
+        // still needs the inherited glob.
+        let unresolved_types = refs
+            .path_roots
+            .iter()
+            .chain(refs.attr_idents.iter())
+            .any(|name| {
+                name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
+            });
         let all_referenced_resolved = !unresolved_types;
         let mut use_items: Vec<Item> = explicit_uses;
         if !all_referenced_resolved {

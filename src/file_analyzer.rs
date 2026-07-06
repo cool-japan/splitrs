@@ -1448,8 +1448,7 @@ fn split_named_module_by_budget(module: Module, budget: usize) -> Vec<Module> {
         chunk
     };
 
-    let chunk_has_content =
-        |m: &Module| !m.types.is_empty() || !m.standalone_items.is_empty();
+    let chunk_has_content = |m: &Module| !m.types.is_empty() || !m.standalone_items.is_empty();
 
     let mut current = new_chunk(0);
     let mut current_lines: usize = 0;
@@ -1515,9 +1514,7 @@ pub(crate) fn cfg_tokens_mention_test(tokens: &proc_macro2::TokenStream) -> bool
     for tt in tokens.clone() {
         match tt {
             proc_macro2::TokenTree::Ident(ident) if ident == "test" => return true,
-            proc_macro2::TokenTree::Group(group)
-                if cfg_tokens_mention_test(&group.stream()) =>
-            {
+            proc_macro2::TokenTree::Group(group) if cfg_tokens_mention_test(&group.stream()) => {
                 return true;
             }
             _ => {}

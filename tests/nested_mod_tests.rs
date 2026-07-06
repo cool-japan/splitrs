@@ -266,7 +266,10 @@ fn plan_decl_preserves_outer_docs_cfg_and_visibility() {
         items: vec![syn::Item::Mod(decl)],
     });
     assert!(rendered.contains("/// Core module docs."), "{rendered}");
-    assert!(rendered.contains("#[cfg(not(feature = \"never\"))]"), "{rendered}");
+    assert!(
+        rendered.contains("#[cfg(not(feature = \"never\"))]"),
+        "{rendered}"
+    );
     assert!(rendered.contains("pub mod core;"), "{rendered}");
 }
 
@@ -414,7 +417,10 @@ fn named_facade_lists_public_items_explicitly() {
     let dir = TempDir::new().expect("tempdir");
     write_plan(&plan, dir.path(), FacadeStyle::Named).expect("write_plan");
     let mod_rs = read(&dir.path().join("core").join("mod.rs"));
-    assert!(!mod_rs.contains("::*;"), "named facade must not glob:\n{mod_rs}");
+    assert!(
+        !mod_rs.contains("::*;"),
+        "named facade must not glob:\n{mod_rs}"
+    );
     assert!(mod_rs.contains("FsEntry"), "{mod_rs}");
     assert!(mod_rs.contains("list_entries"), "{mod_rs}");
     // Private helper must NOT be re-exported.
@@ -452,7 +458,11 @@ fn nested_in_nested_write_creates_grandchild_directory() {
     let outer_mod = read(&dir.path().join("outer").join("mod.rs"));
     assert!(outer_mod.contains("pub mod deep;"), "{outer_mod}");
     assert!(
-        dir.path().join("outer").join("deep").join("mod.rs").exists(),
+        dir.path()
+            .join("outer")
+            .join("deep")
+            .join("mod.rs")
+            .exists(),
         "grandchild mod.rs missing"
     );
     // The sibling file calling `deep::deep_fn()` needs `use super::deep;`.
@@ -497,7 +507,12 @@ fn generated_bucket_name_yields_to_real_child_mod_name() {
     );
     let dir = TempDir::new().expect("tempdir");
     write_plan(&plan, dir.path(), FacadeStyle::Glob).expect("write_plan");
-    assert!(dir.path().join("outer").join("types").join("mod.rs").exists());
+    assert!(dir
+        .path()
+        .join("outer")
+        .join("types")
+        .join("mod.rs")
+        .exists());
     assert_all_files_parse(dir.path());
 }
 

@@ -62,7 +62,6 @@ mod domain_router;
 mod error_recovery;
 mod field_access_tracker;
 mod file_analyzer;
-mod nested_mod_splitter;
 mod glob_import_analyzer;
 mod helper_dependency_tracker;
 mod import_analyzer;
@@ -72,6 +71,7 @@ mod method_analyzer;
 mod metrics_dashboard;
 mod module_generator;
 mod naming_strategy;
+mod nested_mod_splitter;
 mod scope_analyzer;
 mod source_map;
 mod test_generator;
@@ -569,7 +569,11 @@ fn main() -> Result<()> {
 
     // Merge command-line arguments with configuration
     config.merge_with_args(args.max_lines, args.max_impl_lines, args.split_impl_blocks);
-    config.merge_nested_args(args.split_nested_mods, args.max_mod_depth, args.facade.as_deref());
+    config.merge_nested_args(
+        args.split_nested_mods,
+        args.max_mod_depth,
+        args.facade.as_deref(),
+    );
 
     // --extract-tests CLI flag overrides config when set
     if args.extract_tests {
@@ -713,10 +717,7 @@ fn main() -> Result<()> {
 
     // F2: exact (non-glob) rule items that name nothing in this scope are a
     // hard error with near-miss suggestions.
-    domain_router::check_unmatched_patterns(
-        &domain_router::routable_names(&analyzer),
-        &top_rules,
-    )?;
+    domain_router::check_unmatched_patterns(&domain_router::routable_names(&analyzer), &top_rules)?;
 
     println!("Found {} types", analyzer.types.len());
     println!("Found {} standalone items", analyzer.standalone_items.len());
@@ -755,8 +756,7 @@ fn main() -> Result<()> {
     }
     // Every `parent = "..."` rule must have found its descended module.
     nested_mod_splitter::validate_parent_rules(&all_rules, &nested_plans)?;
-    if nested_plans.iter().any(|plan| plan.name == "tests")
-        && !analyzer.extracted_tests.is_empty()
+    if nested_plans.iter().any(|plan| plan.name == "tests") && !analyzer.extracted_tests.is_empty()
     {
         anyhow::bail!(
             "a nested module named `tests` conflicts with the tests.rs produced by \

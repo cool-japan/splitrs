@@ -461,7 +461,9 @@ pub fn validate_target_modules(rules: &[TargetModule]) -> Result<()> {
     let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
     for rule in rules {
         if rule.name.is_empty() {
-            anyhow::bail!("[[target_modules]] rule with empty `name`; every rule needs a module name");
+            anyhow::bail!(
+                "[[target_modules]] rule with empty `name`; every rule needs a module name"
+            );
         }
         if rule.items.is_empty() {
             anyhow::bail!(
@@ -492,12 +494,11 @@ pub fn validate_target_modules(rules: &[TargetModule]) -> Result<()> {
         }
     }
     for (parent, list) in &scopes {
-        if let Some(pos) = list
-            .iter()
-            .position(|r| r.items.iter().any(|p| p == "*"))
-        {
+        if let Some(pos) = list.iter().position(|r| r.items.iter().any(|p| p == "*")) {
             if pos + 1 < list.len() {
-                let scope = parent.map(|p| format!(" (parent `{}`)", p)).unwrap_or_default();
+                let scope = parent
+                    .map(|p| format!(" (parent `{}`)", p))
+                    .unwrap_or_default();
                 anyhow::bail!(
                     "[[target_modules]] rule `{}`{} uses the catch-all pattern `*` but is not \
                      the last rule of its scope; the {} later rule(s) would never match — move \
@@ -814,8 +815,14 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert_eq!(route_item_detailed("compute_hash", &rules), Some((0, "*hash*")));
-        assert_eq!(route_item_detailed("copy_file", &rules), Some((1, "copy_*")));
+        assert_eq!(
+            route_item_detailed("compute_hash", &rules),
+            Some((0, "*hash*"))
+        );
+        assert_eq!(
+            route_item_detailed("copy_file", &rules),
+            Some((1, "copy_*"))
+        );
         assert_eq!(route_item_detailed("unrelated", &rules), None);
     }
 

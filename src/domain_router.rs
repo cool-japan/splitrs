@@ -136,10 +136,7 @@ pub(crate) fn seeded_assign(analyzer: &FileAnalyzer, routing: &mut TargetRouting
         for (pos, candidate) in candidates.iter().enumerate() {
             let mut best: Option<(usize, usize)> = None; // (affinity, module idx)
             for &module_idx in &attractors {
-                let mut affinity = candidate
-                    .refs
-                    .intersection(&defined[module_idx])
-                    .count();
+                let mut affinity = candidate.refs.intersection(&defined[module_idx]).count();
                 if referenced[module_idx].contains(&candidate.name) {
                     affinity += 1;
                 }
@@ -227,10 +224,7 @@ pub fn routable_names(analyzer: &FileAnalyzer) -> HashSet<String> {
 ///
 /// Glob patterns that match nothing are *not* an error — they may
 /// legitimately be speculative — their module is simply not emitted.
-pub fn check_unmatched_patterns(
-    available: &HashSet<String>,
-    rules: &[TargetModule],
-) -> Result<()> {
+pub fn check_unmatched_patterns(available: &HashSet<String>, rules: &[TargetModule]) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
     for rule in rules {
         for pattern in &rule.items {
@@ -246,11 +240,8 @@ pub fn check_unmatched_patterns(
             let hint = if near.is_empty() {
                 String::new()
             } else {
-                let suggestions: Vec<&str> = near
-                    .iter()
-                    .take(3)
-                    .map(|(_, name)| name.as_str())
-                    .collect();
+                let suggestions: Vec<&str> =
+                    near.iter().take(3).map(|(_, name)| name.as_str()).collect();
                 format!(" — did you mean {}?", suggestions.join(", "))
             };
             problems.push(format!(
@@ -281,23 +272,18 @@ pub fn explain_named_module(module: &Module, rules: &[TargetModule]) -> Option<V
             || module
                 .name
                 .strip_prefix(&format!("{}_", rule.name))
-                .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+                .is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+                })
     });
     if !is_rule_module {
         return None;
     }
 
     let mut lines = Vec::new();
-    let mut explain = |name: &str| {
-        match config::route_item_detailed(name, rules) {
-            Some((idx, pattern)) => lines.push(format!(
-                "{} (rule {}: {})",
-                name,
-                idx + 1,
-                pattern
-            )),
-            None => lines.push(format!("{} (seeded)", name)),
-        }
+    let mut explain = |name: &str| match config::route_item_detailed(name, rules) {
+        Some((idx, pattern)) => lines.push(format!("{} (rule {}: {})", name, idx + 1, pattern)),
+        None => lines.push(format!("{} (seeded)", name)),
     };
     for type_info in &module.types {
         explain(&type_info.name);
@@ -320,9 +306,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         current[0] = i + 1;
         for (j, &cb) in b_chars.iter().enumerate() {
             let substitution = previous[j] + usize::from(ca != cb);
-            current[j + 1] = substitution
-                .min(previous[j + 1] + 1)
-                .min(current[j] + 1);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
         }
         std::mem::swap(&mut previous, &mut current);
     }

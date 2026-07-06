@@ -798,7 +798,10 @@ mod tests {
         };
         assert!(deepen_super_in_item(&mut item));
         let rendered = render_item(&item);
-        assert!(rendered.contains("pub(in super::super) fn f()"), "{rendered}");
+        assert!(
+            rendered.contains("pub(in super::super) fn f()"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -834,7 +837,8 @@ mod tests {
         assert!(deepen_super_in_item(&mut item));
         let rendered = render_item(&item);
         assert!(
-            rendered.contains("super :: super :: VALUE") || rendered.contains("super::super::VALUE"),
+            rendered.contains("super :: super :: VALUE")
+                || rendered.contains("super::super::VALUE"),
             "{rendered}"
         );
     }
@@ -852,12 +856,18 @@ mod tests {
             rendered.contains("super::super::super::helper()"),
             "{rendered}"
         );
-        assert!(!rendered.contains("super::super::super::super"), "{rendered}");
+        assert!(
+            !rendered.contains("super::super::super::super"),
+            "{rendered}"
+        );
     }
 
     #[test]
     fn rename_module_collisions_yields_to_child_names() {
-        let mut modules = vec![Module::new("types".to_string()), Module::new("functions".to_string())];
+        let mut modules = vec![
+            Module::new("types".to_string()),
+            Module::new("functions".to_string()),
+        ];
         let mut reserved = HashSet::new();
         reserved.insert("types".to_string());
         rename_module_collisions(&mut modules, &reserved);

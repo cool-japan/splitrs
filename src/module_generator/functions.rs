@@ -231,7 +231,7 @@ fn is_pascal_case(name: &str) -> bool {
 /// Used to decide whether a `pub use module::*;` re-export would actually
 /// expose anything. Items that are not nameable (impls, use statements, etc.)
 /// return `None`.
-pub(super) fn item_visibility(item: &Item) -> Option<&syn::Visibility> {
+pub(crate) fn item_visibility(item: &Item) -> Option<&syn::Visibility> {
     match item {
         Item::Fn(f) => Some(&f.vis),
         Item::Const(c) => Some(&c.vis),
@@ -717,9 +717,13 @@ pub fn generate_tests_rs_full(
     for name in std_prelude_names() {
         resolved.insert(name.to_string());
     }
-    let needs_glob = refs.path_roots.iter().any(|name| {
-        name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
-    });
+    let needs_glob = refs
+        .path_roots
+        .iter()
+        .chain(refs.attr_idents.iter())
+        .any(|name| {
+            name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
+        });
     let mut kept: Vec<Item> = explicit_uses;
     if needs_glob {
         kept.append(&mut glob_uses);
