@@ -180,10 +180,12 @@ pub(crate) fn process_workspace_file(
     // Group into modules
     let modules = analyzer.group_by_module(max_lines);
 
-    // Build type-to-module mapping for super:: imports
+    // Build type-to-module mapping for super:: imports. NOT
+    // `get_exported_types`: `macro_rules!` names are not path-importable and
+    // must never become `use super::macros::name;` (E0432).
     let mut type_to_module: HashMap<String, String> = HashMap::new();
     for module in &modules {
-        for exported_type in module.get_exported_types() {
+        for exported_type in module.importable_exported_names() {
             type_to_module.insert(exported_type, module.name.clone());
         }
     }

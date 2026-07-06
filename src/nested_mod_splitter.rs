@@ -34,8 +34,9 @@ use crate::config::{FacadeStyle, TargetModule};
 use crate::domain_router;
 use crate::file_analyzer::FileAnalyzer;
 use crate::module_generator::{
-    deepen_super_in_use, deepen_super_in_use_tree, extract_test_module_path, generate_mod_rs_ext,
-    generate_tests_rs_full, item_defined_ident, item_visibility, Module, RefVisitor,
+    collect_use_bound_names, deepen_super_in_use, deepen_super_in_use_tree,
+    extract_test_module_path, generate_mod_rs_ext, generate_tests_rs_full, item_defined_ident,
+    item_visibility, Module, RefVisitor,
 };
 use anyhow::{Context, Result};
 use proc_macro2::{Group, Ident, Punct, Spacing, TokenStream, TokenTree};
@@ -272,13 +273,17 @@ pub fn plan_nested_split(
     // forwarded globs; recreate the needed bindings in this level's mod.rs.
     // No deepening: `x/mod.rs` IS the module `x`, the same scope depth the
     // mod body had.
-    let scope_uses = compute_parent_scope_items(
+    let scope = compute_parent_scope_items(
         &child_mods,
         &analyzer.use_statements,
         &modules,
         &mut needs_pub_super,
         false,
     );
+    // Grandchildren reach those bindings only through their forwarded
+    // `use super::*;` globs — tell their emission which names keep them alive.
+    install_parent_scope_provisions(&mut children, &scope);
+    let scope_uses = scope.items;
 
     Ok(NestedModPlan {
         name: mod_item.ident.to_string(),
@@ -313,7 +318,9 @@ pub fn write_plan(
 
     let mut type_to_module: HashMap<String, String> = HashMap::new();
     for module in &plan.modules {
-        for exported in module.get_exported_types() {
+        // NOT `get_exported_types`: `macro_rules!` names are not
+        // path-importable and must never become `use super::macros::name;`.
+        for exported in module.importable_exported_names() {
             type_to_module.insert(exported, module.name.clone());
         }
     }
@@ -480,6 +487,28 @@ pub fn add_child_mod_imports(modules: &mut [Module], child_names: &[String]) {
     }
 }
 
+/// Result of [`compute_parent_scope_items`].
+///
+/// `items` is what the parent-level `mod.rs` must carry; the two name sets
+/// describe what descended child modules can resolve THROUGH that `mod.rs`,
+/// so their emission can decide whether the forwarded `use super::*;` glob
+/// is still load-bearing (see [`install_parent_scope_provisions`]).
+#[derive(Default)]
+pub struct ParentScopeItems {
+    /// The `use` items to emit in the parent's `mod.rs`.
+    pub items: Vec<syn::Item>,
+    /// Names the parent scope provides to descendants: leaves bound by the
+    /// kept parent `use` statements, the `use self::<module>::<name>;`
+    /// re-bindings, `pub` item names (reachable through the facade
+    /// re-exports), and the declared child module names themselves.
+    pub provided_names: HashSet<String>,
+    /// Method names of traits reachable from descendants through the parent
+    /// scope (`pub` traits plus privately re-bound ones). A child module
+    /// calling one of these methods still needs its forwarded glob even
+    /// though the trait never appears as a path root.
+    pub provided_trait_methods: HashSet<String>,
+}
+
 /// Recreate the parent-scope bindings that descended mod bodies depend on.
 ///
 /// Inside an inline `mod x { ... }`, `use super::*;` and `super::name` paths
@@ -495,8 +524,14 @@ pub fn add_child_mod_imports(modules: &mut [Module], child_names: &[String]) {
 ///   visible to its descendants, so this widens nothing);
 /// - `use self::<module>::<name>;` bindings for non-`pub` items that moved
 ///   into generated sibling modules but are referenced from the nested
-///   bodies; referenced private functions are additionally added to
+///   bodies — including traits reached purely through method-call syntax;
+///   referenced private functions are additionally added to
 ///   `needs_pub_super` so their definition site is upgraded.
+///
+/// The returned [`ParentScopeItems`] also carries the provided-name sets the
+/// caller must stamp onto the direct child plans via
+/// [`install_parent_scope_provisions`], so child emission keeps the forwarded
+/// `use super::*;` globs these bindings are reached through.
 ///
 /// `deepen` adds one `super` segment to the pruned parent `use`s for the
 /// in-place `--deepen-super` workflow (where `mod.rs` itself sits one level
@@ -507,16 +542,19 @@ pub fn compute_parent_scope_items(
     modules: &[Module],
     needs_pub_super: &mut HashSet<String>,
     deepen: bool,
-) -> Vec<syn::Item> {
+) -> ParentScopeItems {
     if nested_mods.is_empty() {
-        return Vec::new();
+        return ParentScopeItems::default();
     }
 
     // Names the nested bodies may resolve at the parent scope: bare path
-    // roots (resolved through the body's `use super::*;`), the first
-    // non-`super` segment of `super::...` paths, attribute idents (derives),
-    // and `use super::<name>` heads — minus the names each body defines
-    // itself and path keywords.
+    // roots (resolved through the body's `use super::*;`) and attribute
+    // idents (derives) — minus the names each body binds itself (its item
+    // definitions AND the leaves of its own non-`super` use statements, so a
+    // body-local `use std::collections::HashMap;` does not force the parent
+    // to re-import HashMap it would never use) — plus the first non-`super`
+    // segment of `super::...` paths, which resolve at the parent scope
+    // REGARDLESS of local bindings and are therefore never subtracted.
     let mut referenced: HashSet<String> = HashSet::new();
     let mut method_calls: HashSet<String> = HashSet::new();
     for mod_item in nested_mods {
@@ -525,35 +563,43 @@ pub fn compute_parent_scope_items(
         };
         let mut plain = RefVisitor::default();
         let mut supers = SuperTargetCollector::default();
-        let mut defined: HashSet<String> = HashSet::new();
+        let mut locally_bound: HashSet<String> = HashSet::new();
         for item in body_items {
             plain.visit_item(item);
             supers.visit_item(item);
             if let Some(name) = item_defined_ident(item) {
-                defined.insert(name);
+                locally_bound.insert(name);
             }
+            collect_non_super_use_bound_names(item, &mut locally_bound);
         }
         method_calls.extend(plain.method_calls.iter().cloned());
         let mut names: HashSet<String> = plain.path_roots;
         names.extend(plain.attr_idents);
-        names.extend(supers.names);
         for name in names {
-            if !defined.contains(&name) {
+            if !locally_bound.contains(&name) {
                 referenced.insert(name);
             }
         }
+        referenced.extend(supers.names);
     }
     for keyword in ["super", "crate", "self", "Self"] {
         referenced.remove(keyword);
     }
 
     let mut out: Vec<syn::Item> = Vec::new();
+    let mut provided_names: HashSet<String> = HashSet::new();
+    // The children themselves are declared in the parent's mod.rs, so a
+    // sibling child mod referenced by bare path resolves there too.
+    for mod_item in nested_mods {
+        provided_names.insert(mod_item.ident.to_string());
+    }
 
     // 1. The parent's own use statements, pruned to what the bodies need.
     for use_item in use_statements {
         let Some(pruned) = Module::prune_unused_use(use_item, &referenced, &method_calls) else {
             continue;
         };
+        collect_use_bound_names(&pruned, &mut provided_names);
         if deepen {
             out.push(deepen_super_in_use(&pruned));
         } else {
@@ -561,7 +607,10 @@ pub fn compute_parent_scope_items(
         }
     }
 
-    // 2. Bindings for non-pub items relocated into generated modules.
+    // 2. Bindings for non-pub items relocated into generated modules. A
+    //    private trait is needed even when it never appears as a path root:
+    //    a body method call like `41u64.describe()` requires the trait in
+    //    scope at the (relocated) call site.
     let mut bound: HashSet<String> = HashSet::new();
     for module in modules {
         let mut push_binding = |module_name: &str, name: &str, bound: &mut HashSet<String>| {
@@ -593,7 +642,7 @@ pub fn compute_parent_scope_items(
             let Some(name) = item_defined_ident(item) else {
                 continue;
             };
-            if !referenced.contains(&name) {
+            if !referenced.contains(&name) && !trait_method_called(item, &method_calls) {
                 continue;
             }
             if matches!(item_visibility(item), Some(syn::Visibility::Public(_))) {
@@ -607,8 +656,122 @@ pub fn compute_parent_scope_items(
             push_binding(&module.name, &name, &mut bound);
         }
     }
+    provided_names.extend(bound.iter().cloned());
 
-    out
+    // 3. Public item names (reachable through the facade re-exports) and the
+    //    method sets of every trait the children can reach — recorded so
+    //    child emission knows which unresolved references its forwarded glob
+    //    still serves. `macro_rules!` names are excluded: they are not
+    //    path-importable and flow through `#[macro_use]` instead.
+    let mut provided_trait_methods: HashSet<String> = HashSet::new();
+    for module in modules {
+        for type_info in &module.types {
+            if matches!(
+                item_visibility(&type_info.item),
+                Some(syn::Visibility::Public(_))
+            ) {
+                provided_names.insert(type_info.name.clone());
+            }
+        }
+        for item in &module.standalone_items {
+            let Some(name) = item_defined_ident(item) else {
+                continue;
+            };
+            let is_pub = matches!(item_visibility(item), Some(syn::Visibility::Public(_)));
+            if is_pub {
+                provided_names.insert(name.clone());
+            }
+            if let syn::Item::Trait(trait_item) = item {
+                if is_pub || bound.contains(&name) {
+                    provided_trait_methods.extend(trait_declared_method_names(trait_item));
+                }
+            }
+        }
+    }
+
+    ParentScopeItems {
+        items: out,
+        provided_names,
+        provided_trait_methods,
+    }
+}
+
+/// Stamp what the parent scope provides onto every module of each DIRECT
+/// child plan, so child emission keeps the forwarded `use super::*;` glob
+/// exactly when it is still load-bearing. Lowercase re-bindings
+/// (`use self::functions::make_hidden;`) and method-dispatched traits are
+/// invisible to the uppercase unresolved-type heuristic, so without this
+/// information the glob — their only resolution route — would be dropped.
+pub fn install_parent_scope_provisions(children: &mut [NestedModPlan], scope: &ParentScopeItems) {
+    if scope.provided_names.is_empty() && scope.provided_trait_methods.is_empty() {
+        return;
+    }
+    for child in children.iter_mut() {
+        for module in &mut child.modules {
+            module
+                .parent_scope_names
+                .extend(scope.provided_names.iter().cloned());
+            module
+                .parent_scope_trait_methods
+                .extend(scope.provided_trait_methods.iter().cloned());
+        }
+    }
+}
+
+/// Leaf names a body-local `use` statement binds WITHOUT going through
+/// `super` (its own `std::` / `crate::` / `self::` imports). These names
+/// resolve inside the descended module itself — the statement is forwarded
+/// into the generated files — so the parent scope must not re-import them
+/// (doing so leaves a provably unused import in the parent `mod.rs`).
+fn collect_non_super_use_bound_names(item: &syn::Item, out: &mut HashSet<String>) {
+    let syn::Item::Use(use_stmt) = item else {
+        return;
+    };
+    fn walk(tree: &syn::UseTree, under_super: bool, out: &mut HashSet<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                walk(&path.tree, under_super || path.ident == "super", out);
+            }
+            syn::UseTree::Name(name) if !under_super => {
+                out.insert(name.ident.to_string());
+            }
+            syn::UseTree::Rename(rename) if !under_super => {
+                out.insert(rename.rename.to_string());
+            }
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    walk(tree, under_super, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&use_stmt.tree, false, out);
+}
+
+/// Whether `item` is a trait one of whose declared methods appears in
+/// `method_calls` — the signal that a nested body reaches the trait purely
+/// through method-call syntax (`41u64.describe()`), where the trait name
+/// itself never shows up as a path root.
+fn trait_method_called(item: &syn::Item, method_calls: &HashSet<String>) -> bool {
+    let syn::Item::Trait(trait_item) = item else {
+        return false;
+    };
+    trait_item.items.iter().any(|member| {
+        matches!(member, syn::TraitItem::Fn(f) if method_calls.contains(&f.sig.ident.to_string()))
+    })
+}
+
+/// The method names a trait declares (seeds `provided_trait_methods`).
+fn trait_declared_method_names(trait_item: &syn::ItemTrait) -> Vec<String> {
+    trait_item
+        .items
+        .iter()
+        .filter_map(|member| match member {
+            syn::TraitItem::Fn(f) => Some(f.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Read-only visitor collecting, for every `super::...`-rooted path or use

@@ -649,6 +649,7 @@ fn cli_split_nested_mods_end_to_end() {
     );
     assert!(output.join("core").join("mod.rs").exists());
     assert_all_files_parse(&output);
+    assert_output_compiles(&output);
 }
 
 #[test]
@@ -679,7 +680,7 @@ fn parent_scope_items_bind_private_fns_and_prune_uses() {
     let modules = analyzer.group_by_module(1000);
 
     let mut needs_pub_super = HashSet::new();
-    let scope_uses = compute_parent_scope_items(
+    let scope = compute_parent_scope_items(
         &nested,
         &analyzer.use_statements,
         &modules,
@@ -689,7 +690,7 @@ fn parent_scope_items_bind_private_fns_and_prune_uses() {
     let rendered = prettyplease::unparse(&syn::File {
         shebang: None,
         attrs: Vec::new(),
-        items: scope_uses,
+        items: scope.items,
     });
     // The referenced file-scope import is kept; the unreferenced one pruned.
     assert!(
@@ -703,6 +704,10 @@ fn parent_scope_items_bind_private_fns_and_prune_uses() {
         "{rendered}"
     );
     assert!(needs_pub_super.contains("top_helper"));
+    // Both provided names are advertised to the descended module's emission
+    // so its forwarded `use super::*;` glob survives.
+    assert!(scope.provided_names.contains("top_helper"));
+    assert!(scope.provided_names.contains("HashMap"));
 }
 
 #[test]
@@ -719,14 +724,12 @@ fn macro_defining_module_gets_macro_use_and_first_position() {
     analyzer.set_source(code);
     analyzer.analyze(&file);
     let modules = analyzer.group_by_module(1000);
-    let mod_rs = splitrs::module_generator::generate_mod_rs(
-        &modules,
-        Path::new("/tmp/unused"),
-        None,
-        false,
-        &[],
-    )
-    .expect("generate_mod_rs");
+    // The output-dir parameter is reserved/unused by generate_mod_rs; per
+    // policy, temporary paths in tests come from std::env::temp_dir().
+    let unused_output_dir = std::env::temp_dir();
+    let mod_rs =
+        splitrs::module_generator::generate_mod_rs(&modules, &unused_output_dir, None, false, &[])
+            .expect("generate_mod_rs");
     assert!(mod_rs.contains("#[macro_use]\npub mod macros;"), "{mod_rs}");
     let macros_pos = mod_rs.find("pub mod macros;").expect("macros decl");
     let functions_pos = mod_rs.find("pub mod functions;").expect("functions decl");
@@ -847,6 +850,259 @@ fn cli_max_mod_depth_keeps_deeper_mods_opaque() {
         "the depth-limited mod must survive as an inline `pub mod deep {{ ... }}`"
     );
     assert_all_files_parse(&out);
+}
+
+// ---------------------------------------------------------------------------
+// Compile-level regressions (each emitted tree must actually build)
+// ---------------------------------------------------------------------------
+
+/// Write `code` to a fixture, run the splitrs CLI on it with the given extra
+/// args, and return the output directory.
+fn run_cli(dir: &TempDir, code: &str, extra: &[&str]) -> std::path::PathBuf {
+    let input = dir.path().join("lib_fixture.rs");
+    fs::write(&input, code).expect("write fixture");
+    let output = dir.path().join("out");
+    let cmd = Command::new(env!("CARGO_BIN_EXE_splitrs"))
+        .arg("-i")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(extra)
+        .output()
+        .expect("run splitrs");
+    assert!(
+        cmd.status.success(),
+        "splitrs failed:\n{}\n{}",
+        String::from_utf8_lossy(&cmd.stdout),
+        String::from_utf8_lossy(&cmd.stderr)
+    );
+    output
+}
+
+/// Compile the emitted tree as the module graph of a probe crate
+/// (`rustc --crate-type lib`). Text-level assertions alone let visibility
+/// and name-resolution regressions slip through — rustc is the only arbiter
+/// that the split output still builds.
+fn assert_output_compiles(output: &Path) {
+    let parent = output.parent().expect("output dir has a parent");
+    let mod_dir = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("output dir name is utf-8");
+    let probe = parent.join("compile_probe.rs");
+    fs::write(
+        &probe,
+        format!("#[path = \"{mod_dir}/mod.rs\"]\nmod split_output;\n"),
+    )
+    .expect("write compile probe");
+    let rustc = Command::new("rustc")
+        .arg("--edition")
+        .arg("2021")
+        .arg("--crate-type")
+        .arg("lib")
+        .arg("--out-dir")
+        .arg(parent)
+        .arg(&probe)
+        .output()
+        .expect("run rustc");
+    assert!(
+        rustc.status.success(),
+        "emitted tree does not compile:\n{}",
+        String::from_utf8_lossy(&rustc.stderr)
+    );
+}
+
+/// Concatenated content of every `.rs` file directly inside `dir`.
+fn read_dir_combined(dir: &Path) -> String {
+    let mut combined = String::new();
+    for entry in fs::read_dir(dir).expect("read_dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            combined.push_str(&read(&path));
+        }
+    }
+    combined
+}
+
+#[test]
+fn nested_body_reference_to_private_sibling_mod_compiles() {
+    // Regression: a private inline `mod util` relocated into a generated
+    // bucket used to stay private while mod.rs emitted
+    // `use self::functions::util;` -> error[E0603]: module `util` is private.
+    let code = r#"
+mod util {
+    pub fn helper() -> u64 { 7 }
+}
+
+pub mod core {
+    use super::*;
+
+    pub fn call_util() -> u64 { super::util::helper() }
+    pub fn pad_a() -> u64 { 1 }
+    pub fn pad_b() -> u64 { 2 }
+    pub fn pad_c() -> u64 { 3 }
+}
+"#;
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_cli(
+        &dir,
+        code,
+        &["--split-nested-mods", "true", "--max-lines", "4"],
+    );
+    let top_level = read_dir_combined(&output);
+    assert!(
+        top_level.contains("pub(super) mod util"),
+        "relocated private mod must be widened to pub(super):\n{top_level}"
+    );
+    let mod_rs = read(&output.join("mod.rs"));
+    assert!(mod_rs.contains("::util;"), "{mod_rs}");
+    assert_output_compiles(&output);
+}
+
+#[test]
+fn nested_body_bare_call_to_private_parent_fn_compiles() {
+    // Regression: `make_hidden()` resolved through the body's
+    // `use super::*;`; mod.rs re-bound it, but the forwarded glob in the
+    // descended module was dropped (lowercase names are invisible to the
+    // uppercase glob-keep heuristic) -> error[E0425].
+    let code = r#"
+fn make_hidden() -> u64 { 3 }
+
+pub mod core {
+    use super::*;
+
+    pub fn get() -> u64 { make_hidden() }
+    pub fn pad_a() -> u64 { 1 }
+    pub fn pad_b() -> u64 { 2 }
+    pub fn pad_c() -> u64 { 3 }
+}
+"#;
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_cli(
+        &dir,
+        code,
+        &["--split-nested-mods", "true", "--max-lines", "4"],
+    );
+    let mod_rs = read(&output.join("mod.rs"));
+    assert!(
+        mod_rs.contains("use self::functions::make_hidden;"),
+        "{mod_rs}"
+    );
+    let core_files = read_dir_combined(&output.join("core"));
+    assert!(
+        core_files.contains("use super::super::*;"),
+        "forwarded glob must survive for the lowercase parent binding:\n{core_files}"
+    );
+    assert_output_compiles(&output);
+}
+
+#[test]
+fn nested_body_private_trait_method_call_compiles() {
+    // Regression: a private trait reached ONLY through method-call syntax
+    // (`41u64.describe()`) got neither a mod.rs re-binding (the `referenced`
+    // check ignored method_calls) nor a kept glob -> error[E0599].
+    let code = r#"
+trait Describe {
+    fn describe(&self) -> u64;
+}
+
+impl Describe for u64 {
+    fn describe(&self) -> u64 { *self }
+}
+
+pub mod core {
+    use super::*;
+
+    pub fn label() -> u64 { 41u64.describe() }
+    pub fn pad_a() -> u64 { 1 }
+    pub fn pad_b() -> u64 { 2 }
+    pub fn pad_c() -> u64 { 3 }
+}
+"#;
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_cli(
+        &dir,
+        code,
+        &["--split-nested-mods", "true", "--max-lines", "6"],
+    );
+    let mod_rs = read(&output.join("mod.rs"));
+    assert!(
+        mod_rs.contains("::Describe;"),
+        "method-dispatched private trait must be re-bound in mod.rs:\n{mod_rs}"
+    );
+    assert_output_compiles(&output);
+}
+
+#[test]
+fn macro_defining_split_output_compiles_without_bogus_macro_import() {
+    // Regression: the importable-name map included `macro_rules!` names, so
+    // sibling modules got `use super::macros::twice;` (E0432) which the
+    // `#[macro_use]` declaration then made E0659-ambiguous at every call.
+    let code = r#"
+macro_rules! twice {
+    ($e:expr) => { $e + $e };
+}
+
+pub fn use_it() -> u64 { twice!(21) }
+"#;
+    let dir = TempDir::new().expect("tempdir");
+    let output = run_cli(&dir, code, &["--max-lines", "100"]);
+    let mod_rs = read(&output.join("mod.rs"));
+    assert!(mod_rs.contains("#[macro_use]\npub mod macros;"), "{mod_rs}");
+    let top_level = read_dir_combined(&output);
+    assert!(
+        !top_level.contains("use super::macros::twice;"),
+        "macro_rules names must not be path-imported:\n{top_level}"
+    );
+    assert_output_compiles(&output);
+}
+
+#[test]
+fn body_self_resolved_imports_are_not_duplicated_into_parent_scope() {
+    use splitrs::nested_mod_splitter::compute_parent_scope_items;
+
+    // Regression: names the body resolves through its OWN use statements
+    // stayed in `referenced`, so the parent's matching import was carried
+    // into mod.rs unused -> `warning: unused import` on the emitted crate.
+    let code = r#"
+        use std::collections::HashMap;
+
+        pub fn top(map: &HashMap<String, u64>) -> usize { map.len() }
+
+        pub mod core {
+            use std::collections::HashMap;
+
+            pub fn probe(map: &HashMap<String, u64>) -> usize { map.len() }
+            pub fn pad_a() -> u64 { 1 }
+            pub fn pad_b() -> u64 { 2 }
+        }
+    "#;
+    let file = syn::parse_file(code).expect("parse");
+    let mut analyzer = FileAnalyzer::new(false, 500);
+    analyzer.set_split_nested_mods(true, 3);
+    analyzer.set_source(code);
+    analyzer.analyze(&file);
+    let nested = analyzer.take_nested_mods();
+    assert_eq!(nested.len(), 1);
+    let modules = analyzer.group_by_module(1000);
+
+    let mut needs_pub_super = HashSet::new();
+    let scope = compute_parent_scope_items(
+        &nested,
+        &analyzer.use_statements,
+        &modules,
+        &mut needs_pub_super,
+        false,
+    );
+    let rendered = prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: Vec::new(),
+        items: scope.items,
+    });
+    assert!(
+        !rendered.contains("HashMap"),
+        "parent must not re-import a name the body binds itself:\n{rendered}"
+    );
 }
 
 #[test]

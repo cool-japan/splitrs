@@ -97,6 +97,18 @@ pub struct Module {
     /// call to `core::init()` when `mod core` became `core/`). Emitted as
     /// `use super::<name>;` so those paths keep resolving after the split.
     pub sibling_mod_imports: Vec<String>,
+    /// Names the PARENT directory-module's `mod.rs` provides to this module
+    /// (Feature C: set on every module of a descended nested mod). The body's
+    /// forwarded `use super::*;` glob is the only route to these bindings, so
+    /// referencing one of them keeps the glob alive even when the name is
+    /// lowercase (a `pub(super)`-widened fn) and thus invisible to the
+    /// uppercase unresolved-type heuristic. Empty outside the nested pipeline.
+    pub parent_scope_names: HashSet<String>,
+    /// Method names of traits the parent scope makes reachable (Feature C).
+    /// A trait consumed purely through method-call syntax (`x.describe()`)
+    /// never appears as a path root, so calls into this set are the signal
+    /// that the forwarded glob is still load-bearing.
+    pub parent_scope_trait_methods: HashSet<String>,
 }
 impl Module {
     /// Creates a new empty module with the given name
@@ -118,6 +130,8 @@ impl Module {
             deepen_super: false,
             module_doc: None,
             sibling_mod_imports: Vec::new(),
+            parent_scope_names: HashSet::new(),
+            parent_scope_trait_methods: HashSet::new(),
         }
     }
     /// Get the types exported by this module
@@ -149,6 +163,36 @@ impl Module {
             }
         }
         exported
+    }
+    /// Names of `macro_rules!` definitions in this module.
+    ///
+    /// Declarative macros are not path-importable: without `#[macro_export]`,
+    /// a generated `use super::macros::my_macro;` fails with `error[E0432]`
+    /// (and, combined with the `#[macro_use]` declaration in `mod.rs`, makes
+    /// every invocation `error[E0659]`-ambiguous). They reach sibling modules
+    /// through `#[macro_use]` textual scoping instead, so the import
+    /// machinery must never generate `use` paths for these names.
+    pub fn macro_definition_names(&self) -> HashSet<String> {
+        self.standalone_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Macro(m) => m.ident.as_ref().map(|ident| ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// [`get_exported_types`](Self::get_exported_types) minus
+    /// [`macro_definition_names`](Self::macro_definition_names): the exported
+    /// names sibling modules may import via `use super::<module>::<name>;`.
+    /// Use this — not `get_exported_types` — when building the
+    /// `type_to_module` import map, so `macro_rules!` names never become
+    /// bogus path imports.
+    pub fn importable_exported_names(&self) -> Vec<String> {
+        let macros = self.macro_definition_names();
+        self.get_exported_types()
+            .into_iter()
+            .filter(|name| !macros.contains(name))
+            .collect()
     }
     /// Whether a `pub use <module>::*;` re-export of this module would actually
     /// re-export at least one publicly nameable item.
@@ -929,8 +973,22 @@ impl Module {
                 name.chars().next().is_some_and(|c| c.is_uppercase()) && !resolved.contains(name)
             });
         let all_referenced_resolved = !unresolved_types;
+        // Feature C: the parent directory-module's mod.rs may be the ONLY
+        // provider of some referenced names (lowercase `pub(super)`-widened
+        // fns, re-bound private mods) or of a trait reached purely through
+        // method-call syntax. Both are invisible to the uppercase heuristic
+        // above, yet reaching them requires the forwarded `use super::*;`
+        // glob — so it must be kept whenever one of them is still unresolved.
+        let parent_glob_needed = refs
+            .path_roots
+            .iter()
+            .chain(refs.attr_idents.iter())
+            .any(|name| !resolved.contains(name) && self.parent_scope_names.contains(name))
+            || called_methods
+                .iter()
+                .any(|method| self.parent_scope_trait_methods.contains(method));
         let mut use_items: Vec<Item> = explicit_uses;
-        if !all_referenced_resolved {
+        if !all_referenced_resolved || parent_glob_needed {
             use_items.append(&mut glob_uses);
         }
         if self.deepen_super {
