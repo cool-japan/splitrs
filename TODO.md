@@ -598,7 +598,7 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Codebase: 28,224 lines across 70 Rust files
 - ✅ Test suite: 565 tests passing with `--all-features` (494 with default features), was 450 in v0.3.2
 
-### v0.3.4 (Unreleased)
+### v0.3.4 (Released 2026-07-06)
 - ✅ Widen `collect_use_bound_names` (`src/module_generator/functions.rs`) from `pub(super)` to `pub(crate)` so `nested_mod_splitter` can reuse it to enumerate the bindings a generated `mod.rs` recreates for its descended children (done — powers parent-scope binding recreation)
 - ✅ Review fixes for `--split-nested-mods` correctness: `Item::Mod` visibility widening (E0603), parent-provided `use super::*;` glob retention + private-trait method bindings (E0425/E0599), `macro_rules!` names excluded from importable exports (E0432/E0659), parent-import pruning against the nested body's own use trees (unused_imports)
 - ✅ Test suite: 570 tests passing with `--all-features` (5 new regression tests, one per review finding)

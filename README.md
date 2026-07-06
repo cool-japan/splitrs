@@ -762,7 +762,15 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.3 — Latest Release)
+### Implemented Features (v0.3.4 — Latest Release)
+
+**v0.3.4 Highlights (2026-07-06):**
+- ✅ Nested-mod descent correctness review: relocated private inline `mod` items are widened to `pub(super)` (new `Item::Mod` arm in `upgrade_type_visibility`), fixing `E0603` against the `use self::<bucket>::<mod>;` re-binding in generated `mod.rs`
+- ✅ Parent-scope binding recreation no longer drops the forwarded `use super::*;` glob when an unresolved bare fn call or method belongs to an item the parent scope provides (`compute_parent_scope_items` / `ParentScopeItems`); fixes `E0425`/`E0599` in descended module bodies
+- ✅ `macro_rules!` names excluded from the type-to-module import map, eliminating bogus `use super::macros::<name>;` imports (`E0432`) and the resulting `E0659` ambiguity with `#[macro_use]`-expanded macros
+- ✅ `collect_use_bound_names` widened `pub(super)` → `pub(crate)` so `nested_mod_splitter` can enumerate the bindings a generated `mod.rs` recreates for its descended children
+- ✅ Parent-scope import pruning also subtracts names the nested body binds through its own non-`super` use trees, removing duplicated `unused_imports` warnings from emitted `mod.rs`
+- ✅ Test suite: 570 tests passing with `--all-features` (499 with default features, 1 skipped), was 565 in v0.3.3 — five new regression tests, one per review finding
 
 **v0.3.3 Highlights (2026-07-06):**
 - ✅ Domain-mapping for `--target-modules` (seeded assignment, unknown-name validation, dry-run attribution, extended schema: `parent`/`pull_dependencies`/`doc`/`max_lines`, infix/multi-segment glob patterns, `validate_target_modules()`)
