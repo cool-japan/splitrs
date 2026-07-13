@@ -363,6 +363,12 @@ pub fn write_plan(
             tests_sibling_imports,
             true,
             &tests_parent_resolvable,
+            // TODO: `NestedModPlan` doesn't currently carry the original file's
+            // source text, so nested-mod-split test bodies still lose non-doc
+            // comments to the prettyplease round-trip. Thread it through if/when
+            // this path needs the same byte-verbatim treatment as the top-level
+            // `--extract-tests` output in `main.rs`.
+            None,
         );
         let tests_path = dir.join("tests.rs");
         fs::write(&tests_path, &tests_content)

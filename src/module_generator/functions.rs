@@ -707,6 +707,7 @@ pub fn generate_tests_rs_with_imports_deep(
         sibling_imports,
         deepen_super,
         &HashSet::new(),
+        None,
     )
 }
 /// Full test-module generator: like [`generate_tests_rs_with_imports_deep`] but
@@ -723,12 +724,23 @@ pub fn generate_tests_rs_with_imports_deep(
 /// The two thinner wrappers pass an empty `parent_resolvable`, which keeps all
 /// globs (the conservative pre-existing behaviour) for callers that cannot
 /// supply the parent's export set.
+///
+/// `original_source`, when supplied, is the untouched source text of the file
+/// the test modules were extracted from. Each extracted `mod` is then emitted
+/// **byte-verbatim** (via [`crate::source_map::SourceMap`]) instead of being
+/// re-printed from its `syn` AST through `prettyplease` — the AST round-trip
+/// silently drops every plain `//`/`/* */` comment (only `///`/`//!` doc
+/// comments survive as `#[doc]` attributes), which is unacceptable for test
+/// bodies that document *why* a case exists. Pass `None` when no real source
+/// file backs the `Item`s (e.g. `syn::parse_quote!`-constructed items in unit
+/// tests) to fall back to the old prettyplease rendering.
 pub fn generate_tests_rs_full(
     extracted_tests: &[Item],
     file_uses: &[Item],
     sibling_imports: &HashMap<String, Vec<String>>,
     deepen_super: bool,
     parent_resolvable: &HashSet<String>,
+    original_source: Option<&str>,
 ) -> String {
     let mut content = String::from(
         "//! Auto-generated test module (consolidated from inline `#[cfg(test)] mod` blocks)\n\n",
@@ -817,21 +829,91 @@ pub fn generate_tests_rs_full(
         let original_name = mod_item.ident.to_string();
         let unique_name = pick_unique_mod_name(&original_name, &used_names);
         used_names.insert(unique_name.clone());
-        let mut renamed = mod_item.clone();
-        if unique_name != original_name {
-            renamed.ident = syn::Ident::new(&unique_name, mod_item.ident.span());
-        }
-        let formatted = prettyplease::unparse(&syn::File {
-            shebang: None,
-            attrs: Vec::new(),
-            items: vec![Item::Mod(renamed)],
+
+        // Prefer byte-verbatim emission (preserves inline `//`/`/* */`
+        // comments the `syn` AST cannot carry); fall back to the
+        // prettyplease round-trip when no real source backs this `Item`
+        // (e.g. `syn::parse_quote!`-built items in unit tests) or the span
+        // doesn't resolve to a byte range in it.
+        use syn::spanned::Spanned;
+        let verbatim = original_source.and_then(|src| {
+            let sm = crate::source_map::SourceMap::new(src);
+            sm.item_verbatim_with_indent(mod_item.span(), &mod_item.attrs)
         });
+        let formatted = match verbatim {
+            Some(verbatim_text) => {
+                let mut s = if unique_name != original_name {
+                    rename_mod_ident_verbatim(verbatim_text, &original_name, &unique_name)
+                } else {
+                    verbatim_text.to_string()
+                };
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s
+            }
+            None => {
+                let mut renamed = mod_item.clone();
+                if unique_name != original_name {
+                    renamed.ident = syn::Ident::new(&unique_name, mod_item.ident.span());
+                }
+                prettyplease::unparse(&syn::File {
+                    shebang: None,
+                    attrs: Vec::new(),
+                    items: vec![Item::Mod(renamed)],
+                })
+            }
+        };
         content.push_str(&formatted);
         if !formatted.ends_with('\n') {
             content.push('\n');
         }
     }
     content
+}
+/// Rename the `mod <original>` declaration inside a verbatim-sliced module's
+/// source text to `mod <new_name>`, leaving everything else (the body,
+/// including any occurrences of `original` inside comments/strings/nested
+/// items) untouched. Only the first whole-word `mod` keyword is considered —
+/// that is always the module's own declaration, since [`item_verbatim_with_indent`]
+/// slices start at the item's (or its leading attributes') first token, and
+/// `#[cfg(...)]` attribute text cannot itself contain a bare `mod` keyword.
+///
+/// Returns the text unchanged (rather than risking a corrupt splice) if the
+/// expected `mod <original>` pattern isn't found — this should not happen for
+/// a well-formed `ItemMod` verbatim slice, but a silent no-op is safer than a
+/// mangled file.
+///
+/// [`item_verbatim_with_indent`]: crate::source_map::SourceMap::item_verbatim_with_indent
+fn rename_mod_ident_verbatim(verbatim: &str, original: &str, new_name: &str) -> String {
+    let bytes = verbatim.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while let Some(rel) = verbatim[i..].find("mod") {
+        let start = i + rel;
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after = start + 3;
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if verbatim[j..].starts_with(original) {
+                let end = j + original.len();
+                let ident_after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+                if ident_after_ok {
+                    let mut out = String::with_capacity(verbatim.len());
+                    out.push_str(&verbatim[..j]);
+                    out.push_str(new_name);
+                    out.push_str(&verbatim[end..]);
+                    return out;
+                }
+            }
+        }
+        i = start + 3;
+    }
+    verbatim.to_string()
 }
 /// Pick a non-colliding mod name by appending `_N` until unique.
 ///
@@ -1040,6 +1122,87 @@ mod tests {
         );
     }
     #[test]
+    fn rename_mod_ident_verbatim_only_touches_declaration() {
+        let verbatim =
+            "#[cfg(test)]\nmod tests {\n    // mod tests is mentioned here too\n    fn t() {}\n}\n";
+        let renamed = rename_mod_ident_verbatim(verbatim, "tests", "tests_2");
+        assert!(
+            renamed.starts_with("#[cfg(test)]\nmod tests_2 {"),
+            "declaration must be renamed:\n{renamed}"
+        );
+        assert!(
+            renamed.contains("// mod tests is mentioned here too"),
+            "unrelated `mod tests` inside a comment must be left untouched:\n{renamed}"
+        );
+    }
+    #[test]
+    fn rename_mod_ident_verbatim_noop_when_pattern_missing() {
+        let verbatim = "not a mod item";
+        let renamed = rename_mod_ident_verbatim(verbatim, "tests", "tests_2");
+        assert_eq!(
+            renamed, verbatim,
+            "unmatched input must pass through unchanged"
+        );
+    }
+    #[test]
+    fn tests_rs_full_preserves_inline_comments_verbatim() {
+        // A real source file (not `parse_quote!`) so spans resolve to real
+        // line/column positions `SourceMap` can slice.
+        let source = "#[cfg(test)]\n\
+mod tests {\n    \
+    #[test]\n    \
+    fn t() {\n        \
+        // Explains why 2 is expected here.\n        \
+        assert_eq!(1 + 1, 2);\n    \
+    }\n\
+}\n";
+        let syntax_tree: syn::File = syn::parse_file(source).expect("parse fixture");
+        let test_mod = syntax_tree
+            .items
+            .into_iter()
+            .find(|it| matches!(it, Item::Mod(_)))
+            .expect("fixture must contain a mod item");
+
+        let out = generate_tests_rs_full(
+            std::slice::from_ref(&test_mod),
+            &[],
+            &HashMap::new(),
+            false,
+            &HashSet::new(),
+            Some(source),
+        );
+        assert!(
+            out.contains("// Explains why 2 is expected here."),
+            "inline `//` comment was dropped from verbatim-emitted test mod:\n{out}"
+        );
+        // The lone test mod is literally named `tests`, colliding with the
+        // reserved pseudo-name seeded into `used_names`; it must be renamed
+        // to `tests_2` — and the comment restoration must survive the rename.
+        assert!(
+            out.contains("mod tests_2 {"),
+            "expected the sole `mod tests` to be renamed to `mod tests_2`:\n{out}"
+        );
+    }
+    #[test]
+    fn tests_rs_full_falls_back_to_prettyplease_without_source() {
+        // No `original_source` supplied (e.g. `syn::parse_quote!`-built items
+        // with no real backing file) must still produce valid, non-empty
+        // output via the old AST round-trip -- just without the comment.
+        let test_mod: Item = syn::parse_quote! {
+            #[cfg(test)] mod tests { #[test] fn t() { assert_eq!(1 + 1, 2); } }
+        };
+        let out = generate_tests_rs_full(
+            &[test_mod],
+            &[],
+            &HashMap::new(),
+            false,
+            &HashSet::new(),
+            None,
+        );
+        assert!(out.contains("mod tests_2"), "fallback rename lost:\n{out}");
+        assert!(out.contains("fn t"), "fallback body lost:\n{out}");
+    }
+    #[test]
     fn tests_rs_drops_unused_inherited_glob() {
         let test_mod: Item = syn::parse_quote! {
             #[cfg(test)] mod tests { #[test] fn t() { let _ = Foo::default(); } }
@@ -1055,6 +1218,7 @@ mod tests {
             &HashMap::new(),
             true,
             &parent,
+            None,
         );
         assert!(
             !out.contains("super::cfg") && !out.contains("super::super::cfg"),
@@ -1077,6 +1241,7 @@ mod tests {
             &HashMap::new(),
             true,
             &parent,
+            None,
         );
         assert!(
             out.contains("use super::super::cfg::*;"),

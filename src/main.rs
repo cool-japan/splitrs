@@ -1090,6 +1090,7 @@ fn main() -> Result<()> {
             tests_sibling_imports,
             args.deepen_super,
             &tests_parent_resolvable,
+            Some(&source_code),
         );
         let tests_path = output.join("tests.rs");
         fs::write(&tests_path, &tests_content).context(format!(

@@ -925,6 +925,18 @@ impl Module {
         let refs = self.analyze_references();
         let mut used_for_imports: HashSet<String> = refs.path_roots.clone();
         used_for_imports.extend(refs.attr_idents.iter().cloned());
+        // A private *method* (not free function) relocated to a sibling
+        // `--split-impl-blocks` chunk and called via `self.method(...)` /
+        // `Type::method(...)` syntax is an `ExprMethodCall`/associated-fn
+        // call, not an `ExprPath` -- so it lands in `refs.method_calls`, NOT
+        // `refs.path_roots`. Without this, `cross_module_imports`'s entry for
+        // that method (correctly computed by
+        // `FileAnalyzer::compute_cross_module_visibility`) is filtered back
+        // out below (`functions.filter(|f| used_for_imports.contains(f))`)
+        // as apparently-unused, so the required `use super::<mod>::<method>;`
+        // is silently dropped and the generated file fails to build with
+        // `error[E0624]: method ... is private`.
+        used_for_imports.extend(refs.method_calls.iter().cloned());
         for s in used_idents.iter().chain(used_symbols.iter()) {
             if refs.path_roots.contains(s) || refs.attr_idents.contains(s) {
                 used_for_imports.insert(s.clone());
@@ -994,27 +1006,25 @@ impl Module {
         if self.deepen_super {
             use_items = use_items.iter().map(deepen_super_in_use).collect();
         }
+        // Collect every symbol these two `use` sources already bind, so the
+        // `HashMap`/`HashSet` auto-detection below doesn't re-import one
+        // redundantly (`error[E0252]: the name ... is defined multiple
+        // times`). Walk the AST (`collect_use_bound_names`, which recurses
+        // through nested `UseTree::Group`s) rather than the previous
+        // `extract_imported_symbols(&rendered_string)` approach: that helper
+        // located only the FIRST `{`...`}` pair via `str::find`, so a
+        // multi-segment grouped import like
+        // `std::{borrow::Cow, collections::{HashMap, VecDeque}, ...}`
+        // (i.e. exactly the shape `original_use_statements` forwards
+        // verbatim from a real source file) stopped at the *inner* `}` and
+        // never recognised `HashMap` as already bound.
         let mut already_imported: HashSet<String> = HashSet::new();
         for orig_item in original_use_statements.iter() {
-            let orig_str = quote::quote!(# orig_item).to_string();
-            if orig_str.contains("collections") {
-                for sym in Self::extract_imported_symbols(&orig_str) {
-                    already_imported.insert(sym);
-                }
-            }
+            collect_use_bound_names(orig_item, &mut already_imported);
         }
         if !use_items.is_empty() {
             for item in &use_items {
-                let item_str = prettyplease::unparse(&syn::File {
-                    shebang: None,
-                    attrs: Vec::new(),
-                    items: vec![item.clone()],
-                });
-                if item_str.contains("std::collections") {
-                    for sym in Self::extract_imported_symbols(&item_str) {
-                        already_imported.insert(sym);
-                    }
-                }
+                collect_use_bound_names(item, &mut already_imported);
             }
             let formatted = prettyplease::unparse(&syn::File {
                 shebang: None,
@@ -1184,8 +1194,27 @@ impl Module {
                 {
                     content.push_str(header);
                     content.push('\n');
-                    for body in bodies {
-                        content.push_str(body);
+                    // `bodies` is a byte-verbatim slice per method -- lifted
+                    // straight from the original source, NOT re-printed from
+                    // (a possibly mutated) `method.item`. A method that
+                    // `compute_cross_module_visibility` determined needs
+                    // `pub(super)` (because a sibling `--split-impl-blocks`
+                    // chunk, or another module entirely, calls it) would
+                    // therefore keep its original private visibility forever
+                    // on this fast path, producing `error[E0624]: method ...
+                    // is private` in the generated output despite
+                    // `needs_pub_super` correctly naming it. Text-patch the
+                    // signature line in that case instead of falling back to
+                    // prettyplease (which would cost every OTHER method in
+                    // the group its comments).
+                    for (method, body) in method_group.methods.iter().zip(bodies.iter()) {
+                        let needs_upgrade = needs_pub_super.contains(&method.name)
+                            && matches!(method.item.vis, syn::Visibility::Inherited);
+                        if needs_upgrade {
+                            content.push_str(&upgrade_verbatim_item_visibility(body));
+                        } else {
+                            content.push_str(body);
+                        }
                         // Methods are separated by a blank line for readability;
                         // each `body` is the verbatim method (no trailing newline).
                         content.push_str("\n\n");
@@ -1196,7 +1225,13 @@ impl Module {
                 // Fallback: synthesize and pretty-print (original behavior).
                 let mut impl_items = Vec::new();
                 for method in &method_group.methods {
-                    impl_items.push(syn::ImplItem::Fn(method.item.clone()));
+                    let mut item = method.item.clone();
+                    if needs_pub_super.contains(&method.name)
+                        && matches!(item.vis, syn::Visibility::Inherited)
+                    {
+                        item.vis = syn::parse_quote!(pub (super));
+                    }
+                    impl_items.push(syn::ImplItem::Fn(item));
                 }
                 let impl_block = syn::ItemImpl {
                     attrs: self.impl_attrs.clone(),
@@ -1312,13 +1347,28 @@ impl Module {
                 upgrade_type_visibility(upgrade_function_visibility(item.clone(), needs_pub_super));
             let vis_unchanged =
                 render_vis(item_visibility(item)) == render_vis(item_visibility(&upgraded));
-            let verbatim = if verbs_aligned && vis_unchanged {
-                self.standalone_verbatim[idx].as_deref()
+            // A verbatim slice is still usable even when the visibility
+            // upgrade fired: text-patch the `pub(super) ` prefix onto it
+            // rather than discarding the byte-faithful rendering (preserving
+            // inline `//`/`/* */` comments) for the lossy prettyplease
+            // fallback. Previously ANY upgraded standalone item -- e.g. a
+            // `const fn` table-builder called from a `static` initializer in
+            // a sibling module, a very common cross-module-visibility
+            // outcome -- silently lost every comment in its body the moment
+            // it needed `pub(super)`.
+            let verbatim = if verbs_aligned {
+                self.standalone_verbatim[idx].as_deref().map(|text| {
+                    if vis_unchanged {
+                        text.to_string()
+                    } else {
+                        upgrade_verbatim_item_visibility(text)
+                    }
+                })
             } else {
                 None
             };
             if let Some(text) = verbatim {
-                content.push_str(text);
+                content.push_str(&text);
                 content.push_str("\n\n");
             } else {
                 let formatted = prettyplease::unparse(&syn::File {
@@ -1362,4 +1412,245 @@ pub(crate) struct RefVisitor {
 fn render_vis(opt: Option<&syn::Visibility>) -> String {
     opt.map(|v| quote::quote!(#v).to_string())
         .unwrap_or_default()
+}
+
+/// Insert `pub(super) ` immediately before the declaration line (`fn` /
+/// `async fn` / `const fn` / `unsafe fn` / `struct` / `enum` / `const` /
+/// `static` / `type` / `trait` / `mod`, in any combination with the fn
+/// modifiers) of a byte-verbatim-sliced *private* item, skipping past any
+/// leading trivia: `#[...]` attributes (which may themselves span multiple
+/// physical lines, e.g. a wrapped `#[cfg(\n    feature = "x"\n)]`, tracked via
+/// bracket depth rather than assuming one attribute per line), `//`/`///`/`//!`
+/// line comments, and `/* ... */` block comments (also depth-tracked, so a
+/// nested `/* /* */ */` -- legal in Rust -- doesn't close early).
+///
+/// Used wherever [`Module::generate_content`] emits an item as raw source
+/// text (to preserve inline comments a `syn` AST round-trip would strip)
+/// rather than re-printing a mutated AST node: the `method_group` fast path,
+/// and standalone items whose visibility needed widening. The AST-level
+/// visibility upgrade (`item.vis = pub(super)`, via [`upgrade_function_visibility`]
+/// / [`upgrade_type_visibility`]) used everywhere else in this module cannot
+/// apply on those paths -- there is no (surviving) AST to mutate, only text
+/// to patch, since the whole point of the verbatim fast path is to skip
+/// re-printing from the AST. Every caller upgrades from `Visibility::Inherited`
+/// (private) to exactly `pub(super)`, never any other visibility, so
+/// unconditionally inserting that one literal is sufficient.
+///
+/// Correctly skipping doc comments matters as much as skipping attributes: a
+/// private helper commonly carries a leading `/// ...` doc comment, and
+/// mistaking that line for the declaration would splice `pub(super) ` into
+/// the middle of prose, producing a parse error rather than merely a lost
+/// comment -- silently corrupting output is worse than the bug this function
+/// exists to fix.
+///
+/// Returns the text unchanged if no declaration line is found past all
+/// leading trivia (should not happen for a well-formed item verbatim slice;
+/// a silent no-op is safer than risking a corrupt splice).
+fn upgrade_verbatim_item_visibility(verbatim: &str) -> String {
+    let lines: Vec<&str> = verbatim.lines().collect();
+    let mut attr_depth: i32 = 0;
+    let mut block_comment_depth: i32 = 0;
+    let mut sig_line_idx: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if block_comment_depth > 0 {
+            block_comment_depth = scan_block_comment_depth(trimmed, block_comment_depth);
+            continue;
+        }
+        if attr_depth > 0 {
+            attr_depth = (attr_depth + trimmed.matches('[').count() as i32
+                - trimmed.matches(']').count() as i32)
+                .max(0);
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            block_comment_depth = scan_block_comment_depth(trimmed, 0);
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            attr_depth =
+                (trimmed.matches('[').count() as i32 - trimmed.matches(']').count() as i32).max(0);
+            continue;
+        }
+        sig_line_idx = Some(idx);
+        break;
+    }
+    let Some(idx) = sig_line_idx else {
+        return verbatim.to_string();
+    };
+    let line = lines[idx];
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+
+    let mut out = String::with_capacity(verbatim.len() + "pub(super) ".len());
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if i == idx {
+            out.push_str(indent);
+            out.push_str("pub(super) ");
+            out.push_str(rest);
+        } else {
+            out.push_str(l);
+        }
+    }
+    if verbatim.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Scan `line` left to right for `/*`/`*/` token pairs, starting from
+/// `depth` already-open block comments, and return the resulting depth.
+/// Depth is clamped at 0 (an unmatched `*/` can't go negative). Used to
+/// track `/* ... */` block comments -- including legally nested ones,
+/// `/* outer /* inner */ still outer */` -- across the several physical
+/// lines they may span.
+fn scan_block_comment_depth(line: &str, mut depth: i32) -> i32 {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth = (depth - 1).max(0);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    depth
+}
+
+#[cfg(test)]
+mod verbatim_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn plain_fn_gets_pub_super_prefix() {
+        let out = upgrade_verbatim_item_visibility("fn helper() -> i32 {\n    1\n}");
+        assert!(out.starts_with("pub(super) fn helper()"), "got:\n{out}");
+    }
+
+    #[test]
+    fn leading_doc_comment_is_skipped_not_corrupted() {
+        // The exact shape that broke on the acceptance_e2e_tests.rs
+        // MINI_MONOLITH fixture: a private helper with a `///` doc comment
+        // immediately above its signature. Before the fix, `pub(super) `
+        // was spliced into the COMMENT line, producing a parse error
+        // (`expected one of: fn, extern, use, static, ...`).
+        let verbatim = "/// Shared private helper used by two domains.\nfn normalize(path: &PathBuf) -> String {\n    path.to_string_lossy().to_ascii_lowercase()\n}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with(
+                "/// Shared private helper used by two domains.\npub(super) fn normalize("
+            ),
+            "doc comment must be preserved verbatim and NOT prefixed; signature line must gain \
+             `pub(super) `; got:\n{out}"
+        );
+        syn::parse_str::<syn::ItemFn>(&out)
+            .unwrap_or_else(|e| panic!("must still parse as a valid fn: {e}\n{out}"));
+    }
+
+    #[test]
+    fn multiple_leading_doc_lines_are_all_skipped() {
+        let verbatim = "/// Line one.\n/// Line two.\n///\n/// Line four after a blank doc line.\npub(crate) fn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with(
+                "/// Line one.\n/// Line two.\n///\n/// Line four after a blank doc line.\npub(super) "
+            ),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn attribute_then_doc_comment_both_skipped() {
+        let verbatim = "#[inline]\n/// Docs.\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("#[inline]\n/// Docs.\npub(super) fn helper()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn doc_comment_then_attribute_both_skipped() {
+        let verbatim = "/// Docs.\n#[inline]\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("/// Docs.\n#[inline]\npub(super) fn helper()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multiline_attribute_is_skipped_via_bracket_depth() {
+        let verbatim = "#[cfg(\n    feature = \"x\"\n)]\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("#[cfg(\n    feature = \"x\"\n)]\npub(super) fn helper()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn single_line_block_comment_is_skipped() {
+        let verbatim = "/* a block comment */\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("/* a block comment */\npub(super) fn helper()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multiline_block_comment_is_skipped() {
+        let verbatim = "/*\n * A block comment\n * spanning lines.\n */\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with(
+                "/*\n * A block comment\n * spanning lines.\n */\npub(super) fn helper()"
+            ),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_block_comment_is_skipped() {
+        let verbatim = "/* outer /* inner */ still outer */\nfn helper() {}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("/* outer /* inner */ still outer */\npub(super) fn helper()"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn struct_declaration_gets_prefix_too() {
+        // The fast path isn't fn-specific: standalone items of any kind can
+        // take this route now (see the standalone-items loop in
+        // `Module::generate_content`).
+        let verbatim = "/// A private struct.\nstruct Helper {\n    x: i32,\n}";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert!(
+            out.starts_with("/// A private struct.\npub(super) struct Helper {"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_declaration_line_is_a_safe_noop() {
+        let verbatim = "// just a comment, no item follows";
+        let out = upgrade_verbatim_item_visibility(verbatim);
+        assert_eq!(out, verbatim);
+    }
 }

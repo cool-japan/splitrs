@@ -27,6 +27,22 @@ impl<'ast> Visit<'ast> for RefVisitor {
         if let Some(first) = mac.path.segments.first() {
             self.path_roots.insert(first.ident.to_string());
         }
+        // `write!(dst, ...)` / `writeln!(dst, ...)` expand to a hidden
+        // `dst.write_fmt(format_args!(...))` call -- there is no literal
+        // `.write_fmt(` text in the source for `visit_expr_method_call` to
+        // see, so without this the `std::fmt::Write` (or `std::io::Write`)
+        // import providing that method silently fails `should_keep_trait_import`
+        // and gets pruned, producing `error[E0599]: cannot write into
+        // ...; the trait ... is implemented but not in scope`. Record the
+        // method name these macros invoke so the existing
+        // `known_trait_methods("Write")` / `should_keep_trait_import` path
+        // (already used for ordinary `.write_fmt(...)` calls) keeps the
+        // import alive here too.
+        if let Some(last) = mac.path.segments.last() {
+            if last.ident == "write" || last.ident == "writeln" {
+                self.method_calls.insert("write_fmt".to_string());
+            }
+        }
         let tokens = mac.tokens.clone();
         if let Ok(exprs) = syn::parse::Parser::parse2(
             syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
