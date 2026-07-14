@@ -162,6 +162,132 @@ pub(crate) fn deepen_super_in_use_tree(tree: &mut syn::UseTree) {
         }
     }
 }
+
+/// Prepend a `super::` segment to a `use` item's leading path when that
+/// segment names a module pinned to the regenerated root `mod.rs` — i.e. a
+/// file-backed `mod x;` declaration from the original file (see
+/// [`crate::file_analyzer::FileAnalyzer::file_backed_mods`]). Such
+/// declarations keep their exact original logical path (`<root>::x`) after
+/// the split, so a reference that used to be valid as a bare `x::Item`
+/// (because it sat in the very file that declared `mod x;`) needs rewriting
+/// to `super::x::Item` once the referencing code is relocated into a
+/// different sibling file. Paths already rooted at `super`/`crate`/`self`,
+/// or whose leading segment names anything else (an external crate, `std`,
+/// a locally-defined type, ...), are left untouched.
+pub(crate) fn rewrite_pinned_mod_refs_in_use(
+    use_item: &Item,
+    pinned_mods: &HashSet<String>,
+) -> Item {
+    if pinned_mods.is_empty() {
+        return use_item.clone();
+    }
+    let Item::Use(mut u) = use_item.clone() else {
+        return use_item.clone();
+    };
+    rewrite_pinned_mod_refs_in_use_tree(&mut u.tree, pinned_mods);
+    Item::Use(u)
+}
+
+/// Prepend a `super::` segment to a `UseTree` whose head identifier names one
+/// of `pinned_mods`. See [`rewrite_pinned_mod_refs_in_use`].
+fn rewrite_pinned_mod_refs_in_use_tree(tree: &mut syn::UseTree, pinned_mods: &HashSet<String>) {
+    use syn::UseTree;
+    if let UseTree::Path(p) = tree {
+        if pinned_mods.contains(&p.ident.to_string()) {
+            let inner = (*p.tree).clone();
+            let wrapped = syn::UsePath {
+                ident: syn::Ident::new("super", p.ident.span()),
+                colon2_token: p.colon2_token,
+                tree: Box::new(UseTree::Path(syn::UsePath {
+                    ident: p.ident.clone(),
+                    colon2_token: p.colon2_token,
+                    tree: Box::new(inner),
+                })),
+            };
+            *tree = UseTree::Path(wrapped);
+        }
+    }
+}
+
+/// Type names defined by a `bitflags::bitflags! { ... }` macro INVOCATION, as
+/// opposed to a `macro_rules!` DEFINITION (which `syn::ItemMacro::ident`
+/// already captures directly). `bitflags!` is common enough in systems code
+/// that its expansion shape is worth recognizing specifically: SplitRS
+/// cannot expand arbitrary macros to discover what they define, so without
+/// this, every OTHER generated module that references the flag type by name
+/// fails with `error[E0425]`/`error[E0433]` — `type_to_module` never learns
+/// the name exists because the macro invocation is opaque to `syn`.
+///
+/// Scans the invocation's top-level token stream (not descending into
+/// `{...}`/`[...]`/`(...)` groups, e.g. attribute arguments or the flag
+/// body) for the literal `struct <Ident>` pattern, which `bitflags!`
+/// requires verbatim for every flag type it defines — a single invocation
+/// may legally define more than one.
+pub(crate) fn bitflags_defined_idents(mac: &syn::ItemMacro) -> Vec<String> {
+    let is_bitflags = mac
+        .mac
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "bitflags");
+    if !is_bitflags {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    let mut saw_struct = false;
+    for tt in mac.mac.tokens.clone() {
+        match tt {
+            proc_macro2::TokenTree::Ident(ident) if saw_struct => {
+                names.push(ident.to_string());
+                saw_struct = false;
+            }
+            proc_macro2::TokenTree::Ident(ident) => {
+                saw_struct = ident == "struct";
+            }
+            _ => saw_struct = false,
+        }
+    }
+    names
+}
+
+/// Whether a `bitflags::bitflags! { ... }` invocation (see
+/// [`bitflags_defined_idents`]) defines at least one `pub` flag type.
+///
+/// Consulted by [`Module::has_public_reexport`](super::types::Module::has_public_reexport)
+/// and [`Module::public_export_names`](super::types::Module::public_export_names)
+/// so the generated facade (`pub use <module>::*;`, or the `--facade named`
+/// explicit list) actually re-exports macro-defined types: without this, a
+/// type like `TableOptions` becomes unreachable via the split file's own
+/// public surface (`crate::ast::*`) even though it always was before the
+/// split, breaking any OTHER file that depended on that surface — including
+/// ones this tool cannot edit, such as a Lemon-generated parser.
+pub(crate) fn bitflags_defines_pub_type(mac: &syn::ItemMacro) -> bool {
+    let is_bitflags = mac
+        .mac
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "bitflags");
+    if !is_bitflags {
+        return false;
+    }
+    let mut saw_pub = false;
+    for tt in mac.mac.tokens.clone() {
+        match tt {
+            proc_macro2::TokenTree::Ident(ident) if ident == "struct" && saw_pub => {
+                return true;
+            }
+            proc_macro2::TokenTree::Ident(ident) => {
+                saw_pub = ident == "pub";
+            }
+            // A `pub(crate)`/`pub(super)`/`pub(in path)` qualifier group
+            // directly after `pub`: neither confirms nor cancels it.
+            proc_macro2::TokenTree::Group(_) if saw_pub => {}
+            _ => saw_pub = false,
+        }
+    }
+    false
+}
 /// Extract type names from a syn::Type for import analysis
 ///
 /// Recursively traverses a type expression to find all type names that might
@@ -458,6 +584,15 @@ pub(super) fn apply_specific_field_visibility(
 /// # Returns
 ///
 /// The content of `mod.rs` as a string
+// `main.rs` (the `splitrs` bin) always calls `generate_mod_rs_ext` directly
+// so it can pass pinned file-backed-mod declarations as `child_mods` (see
+// `FileAnalyzer::file_backed_mods`); this convenience wrapper is exercised
+// by the library's own test suite and by external library consumers
+// instead. Mirrors the existing `#![allow(dead_code)]` at the top of
+// `file_analyzer.rs` for the same bin/lib compilation-unit split, just in
+// the opposite direction (there: used by bin, not lib; here: used by lib
+// and tests, not the bin's own private module tree).
+#[allow(dead_code)]
 pub fn generate_mod_rs(
     modules: &[Module],
     output_dir: &Path,

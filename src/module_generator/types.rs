@@ -12,10 +12,11 @@ use syn::visit::Visit;
 use syn::{File, Item};
 
 use super::functions::{
-    apply_field_visibility, apply_specific_field_visibility, collect_use_bound_names,
-    deepen_super_in_use, extract_type_names, item_defined_ident, item_visibility,
-    std_prelude_names, upgrade_function_visibility, upgrade_inherent_impl_methods_visibility,
-    upgrade_type_visibility, use_tree_is_pure_glob,
+    apply_field_visibility, apply_specific_field_visibility, bitflags_defined_idents,
+    bitflags_defines_pub_type, collect_use_bound_names, deepen_super_in_use, extract_type_names,
+    item_defined_ident, item_visibility, rewrite_pinned_mod_refs_in_use, std_prelude_names,
+    upgrade_function_visibility, upgrade_inherent_impl_methods_visibility, upgrade_type_visibility,
+    use_tree_is_pure_glob,
 };
 
 /// Represents a generated module that will be written to a file
@@ -157,6 +158,11 @@ impl Module {
                 Item::Macro(m) => {
                     if let Some(ident) = &m.ident {
                         exported.push(ident.to_string());
+                    } else {
+                        // Invocation, not a `macro_rules!` definition: check
+                        // for recognized macros (currently `bitflags!`) whose
+                        // expansion defines importable type names.
+                        exported.extend(bitflags_defined_idents(m));
                     }
                 }
                 _ => {}
@@ -212,9 +218,10 @@ impl Module {
         if public_type {
             return true;
         }
-        self.standalone_items
-            .iter()
-            .any(|item| matches!(item_visibility(item), Some(syn::Visibility::Public(_))))
+        self.standalone_items.iter().any(|item| {
+            matches!(item_visibility(item), Some(syn::Visibility::Public(_)))
+                || matches!(item, Item::Macro(m) if bitflags_defines_pub_type(m))
+        })
     }
     /// Names of the `pub` items this module defines — the set an explicit
     /// (`--facade named`) re-export list must cover so historical
@@ -233,6 +240,10 @@ impl Module {
             if matches!(item_visibility(item), Some(syn::Visibility::Public(_))) {
                 if let Some(ident) = item_defined_ident(item) {
                     names.push(ident);
+                }
+            } else if let Item::Macro(m) = item {
+                if bitflags_defines_pub_type(m) {
+                    names.extend(bitflags_defined_idents(m));
                 }
             }
         }
@@ -774,18 +785,26 @@ impl Module {
         let Item::Use(use_stmt) = use_item else {
             return None;
         };
-        let pruned_tree = Self::prune_use_tree(&use_stmt.tree, used, called_methods)?;
+        let pruned_tree = Self::prune_use_tree(&use_stmt.tree, used, called_methods, None)?;
         let mut new_use = use_stmt.clone();
         new_use.tree = pruned_tree;
         Some(Item::Use(new_use))
     }
     /// Recursively prune a [`syn::UseTree`], dropping unused leaves.
     ///
+    /// `enclosing_name` is the identifier of the immediately-enclosing path
+    /// segment (e.g. `TokenType` for the `{self, *}` group in
+    /// `crate::dialect::TokenType::{self, *}`), threaded down through
+    /// [`syn::UseTree::Path`] recursion; `None` at the top level. Needed to
+    /// correctly resolve a `self` leaf (see below) — pass `None` when
+    /// calling from outside this function's own recursion.
+    ///
     /// Returns `None` when the entire subtree is unused.
     pub(super) fn prune_use_tree(
         tree: &syn::UseTree,
         used: &HashSet<String>,
         called_methods: &HashSet<String>,
+        enclosing_name: Option<&str>,
     ) -> Option<syn::UseTree> {
         let keep_name = |name: &str| -> bool {
             used.contains(name) || Self::should_keep_trait_import(name, called_methods)
@@ -807,7 +826,9 @@ impl Module {
             }
             syn::UseTree::Glob(_) => Some(tree.clone()),
             syn::UseTree::Path(path) => {
-                let inner = Self::prune_use_tree(&path.tree, used, called_methods)?;
+                let seg_name = path.ident.to_string();
+                let inner =
+                    Self::prune_use_tree(&path.tree, used, called_methods, Some(&seg_name))?;
                 let mut new_path = path.clone();
                 new_path.tree = Box::new(inner);
                 Some(syn::UseTree::Path(new_path))
@@ -815,23 +836,38 @@ impl Module {
             syn::UseTree::Group(group) => {
                 let mut kept: syn::punctuated::Punctuated<syn::UseTree, syn::token::Comma> =
                     syn::punctuated::Punctuated::new();
-                let mut has_non_self = false;
                 let mut self_item: Option<syn::UseTree> = None;
                 for item in &group.items {
                     if matches!(item, syn::UseTree::Name(n) if n.ident == "self") {
                         self_item = Some(item.clone());
                         continue;
                     }
-                    if let Some(pruned) = Self::prune_use_tree(item, used, called_methods) {
+                    if let Some(pruned) =
+                        Self::prune_use_tree(item, used, called_methods, enclosing_name)
+                    {
                         kept.push(pruned);
-                        has_non_self = true;
                     }
                 }
-                if !has_non_self {
-                    return None;
-                }
+                // A `self` leaf inside a group (`use a::b::{self, X};`)
+                // binds the name of the ENCLOSING path segment (`b`), not
+                // the literal text "self" -- decide whether to keep it by
+                // checking THAT name, exactly like any other leaf.
+                // Previously this unconditionally re-added `self` whenever
+                // any sibling leaf survived (which a sibling `*` glob
+                // always does, globs being unconditionally kept), even when
+                // the enclosing name itself was never referenced --
+                // producing spurious `unused_imports` warnings (e.g. a
+                // forwarded `use crate::dialect::TokenType::{self, *};`
+                // keeping the `self` binding in every generated module that
+                // needed some OTHER glob-provided variant but never
+                // referenced the bare `TokenType` name itself).
                 if let Some(self_item) = self_item {
-                    kept.push(self_item);
+                    if enclosing_name.is_some_and(keep_name) {
+                        kept.push(self_item);
+                    }
+                }
+                if kept.is_empty() {
+                    return None;
                 }
                 let mut new_group = group.clone();
                 new_group.items = kept;
@@ -850,6 +886,12 @@ impl Module {
     /// * `cross_module_imports` - Map of source_module -> function_names for this module's imports
     /// * `fields_need_pub_super` - Map of struct_name -> field_names that need visibility upgrade
     /// * `trait_tracker` - Optional tracker for generating trait imports when trait methods are called
+    /// * `pinned_root_mods` - Names of file-backed `mod x;` declarations kept
+    ///   in the regenerated root `mod.rs` (see
+    ///   [`crate::file_analyzer::FileAnalyzer::file_backed_mods`]). A
+    ///   forwarded original `use` statement whose leading path segment
+    ///   names one of these is rewritten to `super::<name>::...` so it
+    ///   keeps resolving from this (non-root) generated file.
     ///
     /// # Returns
     ///
@@ -864,6 +906,7 @@ impl Module {
         cross_module_imports: Option<&HashMap<String, Vec<String>>>,
         fields_need_pub_super: &HashMap<String, HashSet<String>>,
         trait_tracker: Option<&TraitMethodTracker>,
+        pinned_root_mods: &HashSet<String>,
     ) -> String {
         let mut content = String::new();
         if let Some(doc) = &self.module_doc {
@@ -951,6 +994,7 @@ impl Module {
             else {
                 continue;
             };
+            let pruned = rewrite_pinned_mod_refs_in_use(&pruned, pinned_root_mods);
             if use_tree_is_pure_glob(&pruned) {
                 glob_uses.push(pruned);
             } else {

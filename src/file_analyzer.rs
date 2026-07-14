@@ -147,6 +147,23 @@ pub struct FileAnalyzer {
     /// `split_nested_mods` is enabled. Drained via [`Self::take_nested_mods`].
     pub nested_mods: Vec<syn::ItemMod>,
 
+    /// File-backed submodule declarations (`pub mod x;` — `content: None`,
+    /// as opposed to an inline `mod x { ... }` body) found in the original
+    /// file. Such a declaration names a physical sibling file/directory
+    /// (`x.rs` or `x/mod.rs`) resolved relative to the file that DECLARES
+    /// it, and its logical module path is exactly `<declaring-scope>::x`.
+    /// Relocating it into an arbitrary generated bucket file (the default
+    /// treatment for any other item) would silently change both: Rust would
+    /// look for the sibling file in the wrong directory (`error[E0583]`),
+    /// and any code elsewhere in the crate addressing it by absolute path
+    /// (`crate::...::x::Item`) would break because its logical module path
+    /// shifted too (e.g. from `ast::fmt` to `ast::functions::fmt`). These
+    /// are therefore never bucketed like ordinary standalone items — they
+    /// stay pinned to the regenerated root `mod.rs`, verbatim, exactly
+    /// where they originally lived. Drained via
+    /// [`Self::take_file_backed_mods`].
+    pub file_backed_mods: Vec<syn::ItemMod>,
+
     /// Item #5: File-level `//!` inner doc attributes captured from the
     /// parsed `syn::File.attrs`. These are emitted at the top of `mod.rs`
     /// and the primary module file to preserve crate/module documentation.
@@ -184,6 +201,7 @@ impl FileAnalyzer {
             split_nested_mods: false,
             nested_mod_budget: usize::MAX,
             nested_mods: Vec::new(),
+            file_backed_mods: Vec::new(),
             file_inner_docs: Vec::new(),
             source_code: None,
         }
@@ -255,6 +273,15 @@ impl FileAnalyzer {
     /// Drain the diverted inline modules collected for nested splitting.
     pub fn take_nested_mods(&mut self) -> Vec<syn::ItemMod> {
         std::mem::take(&mut self.nested_mods)
+    }
+
+    /// Drain the file-backed submodule declarations (`mod x;`) collected
+    /// during [`Self::analyze`]. The caller must re-declare each one,
+    /// verbatim, in the regenerated root `mod.rs` — see
+    /// [`Self::file_backed_mods`] for why they can never be bucketed like
+    /// ordinary standalone items.
+    pub fn take_file_backed_mods(&mut self) -> Vec<syn::ItemMod> {
+        std::mem::take(&mut self.file_backed_mods)
     }
 
     /// Drain the collected inline test modules, leaving the analyzer empty.
@@ -438,6 +465,17 @@ impl FileAnalyzer {
                         && Self::is_splittable_nested_mod(mod_item, self.nested_mod_budget)
                     {
                         self.nested_mods.push(mod_item.clone());
+                        continue;
+                    }
+
+                    // File-backed declaration (no inline body): must stay
+                    // pinned to the root `mod.rs` rather than fall into the
+                    // generic bucketing below — see `file_backed_mods` for
+                    // why relocating it elsewhere is unsound regardless of
+                    // `--split-nested-mods` (which only concerns INLINE
+                    // `mod x { ... }` bodies, a different case entirely).
+                    if mod_item.content.is_none() {
+                        self.file_backed_mods.push(mod_item.clone());
                         continue;
                     }
 

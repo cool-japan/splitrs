@@ -23,6 +23,27 @@ impl<'ast> Visit<'ast> for RefVisitor {
         self.method_calls.insert(call.method.to_string());
         visit::visit_expr_method_call(self, call);
     }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        // `Type::from_str(...)` is an associated-function call (`ExprCall`
+        // over an `Expr::Path`), not a `.method()` call, so
+        // `visit_expr_method_call` above never sees it -- yet resolving it
+        // requires `std::str::FromStr` in scope exactly like a real method
+        // call would. Same shape as the `write!`/`writeln!` case below:
+        // without this, a forwarded `use std::str::FromStr;` looks unused
+        // to `should_keep_trait_import` and gets pruned, producing
+        // `error[E0599]: no function or associated item named 'from_str'
+        // found for type '...'`.
+        if let syn::Expr::Path(p) = &*call.func {
+            if p.path.segments.len() >= 2 {
+                if let Some(last) = p.path.segments.last() {
+                    if last.ident == "from_str" {
+                        self.method_calls.insert("from_str".to_string());
+                    }
+                }
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if let Some(first) = mac.path.segments.first() {
             self.path_roots.insert(first.ident.to_string());
