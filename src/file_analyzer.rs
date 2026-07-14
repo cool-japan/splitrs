@@ -147,6 +147,23 @@ pub struct FileAnalyzer {
     /// `split_nested_mods` is enabled. Drained via [`Self::take_nested_mods`].
     pub nested_mods: Vec<syn::ItemMod>,
 
+    /// File-backed submodule declarations (`pub mod x;` — `content: None`,
+    /// as opposed to an inline `mod x { ... }` body) found in the original
+    /// file. Such a declaration names a physical sibling file/directory
+    /// (`x.rs` or `x/mod.rs`) resolved relative to the file that DECLARES
+    /// it, and its logical module path is exactly `<declaring-scope>::x`.
+    /// Relocating it into an arbitrary generated bucket file (the default
+    /// treatment for any other item) would silently change both: Rust would
+    /// look for the sibling file in the wrong directory (`error[E0583]`),
+    /// and any code elsewhere in the crate addressing it by absolute path
+    /// (`crate::...::x::Item`) would break because its logical module path
+    /// shifted too (e.g. from `ast::fmt` to `ast::functions::fmt`). These
+    /// are therefore never bucketed like ordinary standalone items — they
+    /// stay pinned to the regenerated root `mod.rs`, verbatim, exactly
+    /// where they originally lived. Drained via
+    /// [`Self::take_file_backed_mods`].
+    pub file_backed_mods: Vec<syn::ItemMod>,
+
     /// Item #5: File-level `//!` inner doc attributes captured from the
     /// parsed `syn::File.attrs`. These are emitted at the top of `mod.rs`
     /// and the primary module file to preserve crate/module documentation.
@@ -184,6 +201,7 @@ impl FileAnalyzer {
             split_nested_mods: false,
             nested_mod_budget: usize::MAX,
             nested_mods: Vec::new(),
+            file_backed_mods: Vec::new(),
             file_inner_docs: Vec::new(),
             source_code: None,
         }
@@ -255,6 +273,15 @@ impl FileAnalyzer {
     /// Drain the diverted inline modules collected for nested splitting.
     pub fn take_nested_mods(&mut self) -> Vec<syn::ItemMod> {
         std::mem::take(&mut self.nested_mods)
+    }
+
+    /// Drain the file-backed submodule declarations (`mod x;`) collected
+    /// during [`Self::analyze`]. The caller must re-declare each one,
+    /// verbatim, in the regenerated root `mod.rs` — see
+    /// [`Self::file_backed_mods`] for why they can never be bucketed like
+    /// ordinary standalone items.
+    pub fn take_file_backed_mods(&mut self) -> Vec<syn::ItemMod> {
+        std::mem::take(&mut self.file_backed_mods)
     }
 
     /// Drain the collected inline test modules, leaving the analyzer empty.
@@ -438,6 +465,17 @@ impl FileAnalyzer {
                         && Self::is_splittable_nested_mod(mod_item, self.nested_mod_budget)
                     {
                         self.nested_mods.push(mod_item.clone());
+                        continue;
+                    }
+
+                    // File-backed declaration (no inline body): must stay
+                    // pinned to the root `mod.rs` rather than fall into the
+                    // generic bucketing below — see `file_backed_mods` for
+                    // why relocating it elsewhere is unsound regardless of
+                    // `--split-nested-mods` (which only concerns INLINE
+                    // `mod x { ... }` bodies, a different case entirely).
+                    if mod_item.content.is_none() {
+                        self.file_backed_mods.push(mod_item.clone());
                         continue;
                     }
 
@@ -1072,6 +1110,91 @@ impl FileAnalyzer {
         routing
     }
 
+    /// Every callable name *defined* by `module`: standalone free functions,
+    /// methods of standalone `impl` blocks, trait-impl methods, methods of
+    /// type-bundled inherent/trait impls, and methods inside
+    /// `--split-impl-blocks` chunks (`module.method_group`).
+    ///
+    /// Shared by both passes in [`Self::compute_cross_module_visibility`]:
+    /// the "who defines this name" map (`fn_to_module`) and the "what does
+    /// this module call, that must resolve to a definer" set (`owner_names`)
+    /// MUST be built from the exact same source list. Letting them diverge is
+    /// what previously caused a real bug: `fn_to_module` was built from
+    /// standalone free functions only, so a method living solely in a
+    /// `method_group` chunk (i.e. a method of an oversized `impl` block that
+    /// `--split-impl-blocks` moved into its own file) was a valid *callee*
+    /// but not a recognised *definition site*. A cross-chunk call to such a
+    /// method — extremely common, since `--split-impl-blocks` splits one
+    /// `impl` across several files whose methods keep calling each other —
+    /// then silently skipped both the `pub(super)` visibility upgrade and the
+    /// `use super::<module>::<method>;` import, producing `error[E0624]:
+    /// method ... is private` (or, when an inherent method shares a name with
+    /// a trait method that delegates to it, a false `unconditional_recursion`
+    /// once the inherent method becomes unreachable from the trait impl's
+    /// module) in the generated output.
+    ///
+    /// This is a flat name -> module map with no receiver-type
+    /// disambiguation, consistent with the rest of this heuristic pass: two
+    /// distinct types with a same-named method (`Foo::new` / `Bar::new`)
+    /// collapse to whichever definition is inserted last. That can, in rare
+    /// cases, cause an unrelated same-named method to be upgraded to
+    /// `pub(super)` or given an unused import — both are safe
+    /// over-approximations caught by `-W unused`, not compile errors. It can
+    /// never reproduce the under-approximation this fixes, which was a hard
+    /// compile failure.
+    fn module_defined_callables(module: &Module) -> Vec<String> {
+        fn push_impl_methods(impl_block: &syn::ItemImpl, names: &mut Vec<String>) {
+            for item in &impl_block.items {
+                if let syn::ImplItem::Fn(method) = item {
+                    names.push(method.sig.ident.to_string());
+                }
+            }
+        }
+
+        let mut names: Vec<String> = Vec::new();
+
+        for item in &module.standalone_items {
+            match item {
+                Item::Fn(f) => names.push(f.sig.ident.to_string()),
+                Item::Impl(impl_item) => push_impl_methods(impl_item, &mut names),
+                _ => {}
+            }
+        }
+
+        for trait_impl in &module.trait_impls {
+            if let Item::Impl(impl_item) = &trait_impl.impl_item {
+                push_impl_methods(impl_item, &mut names);
+            }
+        }
+
+        // Methods bundled with their owning type. The previous version of
+        // this pass only iterated `module.standalone_items`, which missed
+        // cross-module helper calls invoked from these methods — resulting
+        // in `error[E0425]: cannot find function ... in this scope` when the
+        // callee sat in a sibling module like `functions.rs`.
+        for type_info in &module.types {
+            for impl_item in &type_info.impls {
+                if let Item::Impl(impl_block) = impl_item {
+                    push_impl_methods(impl_block, &mut names);
+                }
+            }
+            for trait_impl in &type_info.trait_impls {
+                if let Item::Impl(impl_block) = &trait_impl.impl_item {
+                    push_impl_methods(impl_block, &mut names);
+                }
+            }
+        }
+
+        // Methods inside per-impl-chunk modules produced by `--split-impl-blocks`.
+        if let Some(method_group) = &module.method_group {
+            for method in &method_group.methods {
+                names.push(method.item.sig.ident.to_string());
+            }
+        }
+
+        names
+    }
+
     /// Compute which private functions need to be made pub(super) for cross-module access
     ///
     /// Returns:
@@ -1094,12 +1217,36 @@ impl FileAnalyzer {
         // struct_name -> field_names that need pub(super)
         let mut fields_need_pub_super: HashMap<String, HashSet<String>> = HashMap::new();
 
-        // Build a map of function name -> module name
+        // Build a map of callable name -> module name. See
+        // `module_defined_callables` for why this must NOT be narrowed to
+        // just standalone free functions (`Item::Fn`).
         let mut fn_to_module: HashMap<String, String> = HashMap::new();
+        for module in modules {
+            for name in Self::module_defined_callables(module) {
+                fn_to_module.insert(name, module.name.clone());
+            }
+        }
+
+        // Narrower companion map: FREE FUNCTIONS only. `fn_to_module` above
+        // is deliberately widened to cover methods too (a cross-chunk
+        // `self.method()` call needs its callee visibility-upgraded exactly
+        // like a free-function call does) -- but only a free function is a
+        // valid target of a `use super::<module>::<name>;` import. A method
+        // is not a module-level path item: `receiver.method()` resolves
+        // through type-directed lookup across every reachable `impl` of the
+        // receiver's type, gated purely by visibility, never by whether its
+        // name happens to be `use`-imported. Emitting `use
+        // super::fs::key;` for `FileEntry::key` is a hard compile error
+        // (E0432: "no `key` in `core::fs`") even though `key` parses fine as
+        // a `use` path syntactically -- `syn::parse_file` cannot catch it,
+        // only `rustc`/`cargo check` can. Import-emission below is gated on
+        // this map so cross-module method calls only ever contribute the
+        // (always correct) visibility upgrade, never a bogus import.
+        let mut free_fn_to_module: HashMap<String, String> = HashMap::new();
         for module in modules {
             for item in &module.standalone_items {
                 if let Item::Fn(f) = item {
-                    fn_to_module.insert(f.sig.ident.to_string(), module.name.clone());
+                    free_fn_to_module.insert(f.sig.ident.to_string(), module.name.clone());
                 }
             }
         }
@@ -1112,67 +1259,45 @@ impl FileAnalyzer {
             }
         }
 
+        // Build a map of const/static item name -> module name. Needed
+        // specifically for the extracted-tests block below: ordinary
+        // per-module code that references a const/static defined in a
+        // sibling module gets its import from a *different*, broader
+        // mechanism inside `Module::generate_content` (the `type_to_module`
+        // parameter, built externally from `get_exported_types()` and
+        // covering any exported name, not just functions) -- constants
+        // always end up `pub(super)` regardless via `upgrade_type_visibility`'s
+        // unconditional widening of const/static/struct/... items, so that
+        // path only has to add the `use` line, not worry about privacy.
+        // `tests.rs`, however, is rendered by an entirely separate function
+        // (`generate_tests_rs_full`) that never sees `type_to_module` and
+        // only knows about `cross_module_imports` -- which, before this map,
+        // could only ever name a function/method (`fn_to_module`). A test
+        // referencing a sibling module's constant directly by name (common:
+        // `SIZE_MARKER_8BIT`, `MAX_JSON_DEPTH`, ...) therefore compiled fine
+        // in production code but failed in `tests.rs` with `error[E0425]:
+        // cannot find value ... in this scope`.
+        let mut const_static_to_module: HashMap<String, String> = HashMap::new();
+        for module in modules {
+            for item in &module.standalone_items {
+                let name = match item {
+                    Item::Const(c) => Some(c.ident.to_string()),
+                    Item::Static(s) => Some(s.ident.to_string()),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    const_static_to_module.insert(name, module.name.clone());
+                }
+            }
+        }
+
         // For each module, check if any of its items call private functions in other modules
         for module in modules {
             // Collect the names of every function / method *defined* in this
-            // module whose body we must scan for cross-module calls.
-            //
-            // We gather names from the same five locations the previous
-            // implementation walked individually:
-            //   1. standalone free functions,
-            //   2. methods of `impl Trait for f32`-style standalone impl blocks,
-            //   3. trait-impl methods (`module.trait_impls`),
-            //   4. methods of type-bundled inherent + trait impls
-            //      (`module.types[*].impls` / `.trait_impls`),
-            //   5. methods inside split-impl chunks (`module.method_group`).
-            let mut owner_names: Vec<String> = Vec::new();
-
-            let push_impl_methods = |impl_block: &syn::ItemImpl, names: &mut Vec<String>| {
-                for item in &impl_block.items {
-                    if let syn::ImplItem::Fn(method) = item {
-                        names.push(method.sig.ident.to_string());
-                    }
-                }
-            };
-
-            for item in &module.standalone_items {
-                match item {
-                    Item::Fn(f) => owner_names.push(f.sig.ident.to_string()),
-                    Item::Impl(impl_item) => push_impl_methods(impl_item, &mut owner_names),
-                    _ => {}
-                }
-            }
-
-            for trait_impl in &module.trait_impls {
-                if let Item::Impl(impl_item) = &trait_impl.impl_item {
-                    push_impl_methods(impl_item, &mut owner_names);
-                }
-            }
-
-            // Methods bundled with their owning type. The previous version of
-            // this pass only iterated `module.standalone_items`, which missed
-            // cross-module helper calls invoked from these methods — resulting
-            // in `error[E0425]: cannot find function ... in this scope` when the
-            // callee sat in a sibling module like `functions.rs`.
-            for type_info in &module.types {
-                for impl_item in &type_info.impls {
-                    if let Item::Impl(impl_block) = impl_item {
-                        push_impl_methods(impl_block, &mut owner_names);
-                    }
-                }
-                for trait_impl in &type_info.trait_impls {
-                    if let Item::Impl(impl_block) = &trait_impl.impl_item {
-                        push_impl_methods(impl_block, &mut owner_names);
-                    }
-                }
-            }
-
-            // Methods inside per-impl-chunk modules produced by `--split-impl-blocks`.
-            if let Some(method_group) = &module.method_group {
-                for method in &method_group.methods {
-                    owner_names.push(method.item.sig.ident.to_string());
-                }
-            }
+            // module whose body we must scan for cross-module calls. Must be
+            // the exact same source list `fn_to_module` was built from above
+            // (see `module_defined_callables`).
+            let owner_names = Self::module_defined_callables(module);
 
             // Derive two call sets from the owners:
             //   * `private_helper_calls` — private helpers reachable from the
@@ -1193,6 +1318,27 @@ impl FileAnalyzer {
             // Every private helper we depend on must also be importable.
             all_calls.extend(private_helper_calls.iter().cloned());
 
+            // `self.helper_tracker` is keyed by function/method name (it
+            // only ever indexes `Item::Fn` / impl methods as *callers*), so
+            // the two loops above are blind to a `const`/`static` item whose
+            // *initializer expression* calls a helper -- e.g. `static
+            // TABLE: [u8; 256] = build_table();`. Such an item is neither in
+            // `owner_names` (it defines no callable) nor recognised by the
+            // tracker as a caller, so `build_table` previously kept its
+            // original private visibility forever if it landed in a sibling
+            // module: `error[E0603]: function ... is private` despite the
+            // (separately-derived, syntax-level) import for it resolving
+            // fine. Directly walk this module's const/static initializers
+            // with `RefVisitor` and fold their referenced names into
+            // `all_calls` so they get the same import + upgrade treatment.
+            let mut const_static_refs = RefVisitor::default();
+            for item in &module.standalone_items {
+                if matches!(item, Item::Const(_) | Item::Static(_)) {
+                    const_static_refs.visit_item(item);
+                }
+            }
+            all_calls.extend(const_static_refs.path_roots.iter().cloned());
+
             // For each called function, check if it lives in a different module.
             for called_fn in &all_calls {
                 let Some(source_module) = fn_to_module.get(called_fn) else {
@@ -1202,13 +1348,18 @@ impl FileAnalyzer {
                     continue;
                 }
 
-                // Cross-module call: this module needs `use super::<src>::<fn>;`.
-                cross_module_imports
-                    .entry(module.name.clone())
-                    .or_default()
-                    .entry(source_module.clone())
-                    .or_default()
-                    .push(called_fn.clone());
+                // Cross-module call: this module needs `use super::<src>::<fn>;`
+                // -- but ONLY when `called_fn` is a genuine free function. See
+                // `free_fn_to_module`'s doc comment for why a method must
+                // never be named in a `use` path.
+                if free_fn_to_module.contains_key(called_fn) {
+                    cross_module_imports
+                        .entry(module.name.clone())
+                        .or_default()
+                        .entry(source_module.clone())
+                        .or_default()
+                        .push(called_fn.clone());
+                }
 
                 // Only *private* callees additionally need a visibility upgrade.
                 if self.helper_tracker.is_private_helper(called_fn) {
@@ -1235,16 +1386,35 @@ impl FileAnalyzer {
                 refs.visit_item(item);
             }
             for called_fn in &refs.path_roots {
-                let Some(source_module) = fn_to_module.get(called_fn) else {
+                if let Some(source_module) = fn_to_module.get(called_fn) {
+                    // Only *private* helpers need explicit handling: they are upgraded
+                    // to `pub(super)` and named directly from `tests.rs`. Public
+                    // functions are already re-exported into the test scope via the
+                    // `use super::*;` → `pub use <module>::*;` chain, so importing them
+                    // again would be redundant (and noisy under `-D warnings`).
+                    if self.helper_tracker.is_private_helper(called_fn) {
+                        needs_pub_super.insert(called_fn.clone());
+                        cross_module_imports
+                            .entry("tests".to_string())
+                            .or_default()
+                            .entry(source_module.clone())
+                            .or_default()
+                            .push(called_fn.clone());
+                    }
                     continue;
-                };
-                // Only *private* helpers need explicit handling: they are upgraded
-                // to `pub(super)` and named directly from `tests.rs`. Public
-                // functions are already re-exported into the test scope via the
-                // `use super::*;` → `pub use <module>::*;` chain, so importing them
-                // again would be redundant (and noisy under `-D warnings`).
-                if self.helper_tracker.is_private_helper(called_fn) {
-                    needs_pub_super.insert(called_fn.clone());
+                }
+                // A const/static (see `const_static_to_module`'s doc comment):
+                // always import when referenced from a sibling module, no
+                // privacy gate needed. Unlike functions, these are never
+                // reachable via `tests.rs`'s inherited `use super::*;` glob
+                // chain regardless of their own visibility (that chain only
+                // carries whatever the parent directory module's `pub use`
+                // facade re-exports, which never includes `pub(super)`
+                // items), and `upgrade_type_visibility` unconditionally
+                // widens every private const/static to `pub(super)`
+                // elsewhere, so the visibility side is already handled by
+                // the time this runs.
+                if let Some(source_module) = const_static_to_module.get(called_fn) {
                     cross_module_imports
                         .entry("tests".to_string())
                         .or_default()

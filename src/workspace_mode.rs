@@ -6,11 +6,11 @@
 
 use crate::error_recovery;
 use crate::file_analyzer::FileAnalyzer;
-use crate::module_generator::{extract_test_module_path, generate_mod_rs};
+use crate::module_generator::{extract_test_module_path, generate_mod_rs_ext};
 use crate::workspace;
 use crate::Args;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::Item;
@@ -177,6 +177,15 @@ pub(crate) fn process_workspace_file(
     analyzer.set_source(&source_code);
     analyzer.analyze_with_test_files(&syntax_tree, input);
 
+    // File-backed `mod x;` declarations must stay declared in the
+    // regenerated root `mod.rs` verbatim — see
+    // `FileAnalyzer::file_backed_mods`.
+    let file_backed_mods = analyzer.take_file_backed_mods();
+    let pinned_root_mod_names: HashSet<String> = file_backed_mods
+        .iter()
+        .map(|m| m.ident.to_string())
+        .collect();
+
     // Group into modules
     let modules = analyzer.group_by_module(max_lines);
 
@@ -217,6 +226,7 @@ pub(crate) fn process_workspace_file(
             cross_module_imports.get(&module.name),
             &fields_need_pub_super,
             Some(&analyzer.trait_tracker),
+            &pinned_root_mod_names,
         );
         fs::write(&module_path, &content)?;
     }
@@ -229,9 +239,20 @@ pub(crate) fn process_workspace_file(
         let test_module_path = extract_test_module_path(&syntax_tree);
         let mod_rs_path = output.join("mod.rs");
         // Workspace mode does not currently support --extract-tests, so
-        // pass `false` for the inline-tests flag.
-        let mod_content =
-            generate_mod_rs(&modules, &output, test_module_path.as_deref(), false, &[])?;
+        // pass `false` for the inline-tests flag. `file_backed_mods` are
+        // passed as `child_mods` so they stay pinned to this mod.rs exactly
+        // as they were in the original file.
+        let mod_content = generate_mod_rs_ext(
+            &modules,
+            &output,
+            test_module_path.as_deref(),
+            false,
+            &[],
+            &[],
+            &file_backed_mods,
+            crate::config::FacadeStyle::Glob,
+            &[],
+        )?;
         fs::write(&mod_rs_path, &mod_content)?;
     }
 

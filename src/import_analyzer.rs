@@ -271,6 +271,7 @@ impl TypeVisitor {
         }
     }
 
+    #[allow(dead_code)]
     fn extract_type_name(&mut self, ty: &Type) {
         match ty {
             Type::Path(TypePath { path, .. }) => {

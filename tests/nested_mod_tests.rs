@@ -600,6 +600,7 @@ fn add_child_mod_imports_records_only_real_references() {
         None,
         &std::collections::HashMap::new(),
         None,
+        &HashSet::new(),
     );
     assert!(
         content.contains("use super::core;"),

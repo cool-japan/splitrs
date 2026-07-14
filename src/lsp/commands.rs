@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use tokio::task;
@@ -44,6 +44,15 @@ fn perform_split_sync(
     let splitrs = &config.splitrs;
     let mut analyzer = FileAnalyzer::new(splitrs.split_impl_blocks, splitrs.max_impl_lines);
     analyzer.analyze(&file);
+
+    // File-backed `mod x;` declarations must stay declared in the
+    // regenerated root `mod.rs` verbatim — see
+    // `FileAnalyzer::file_backed_mods`.
+    let file_backed_mods = analyzer.take_file_backed_mods();
+    let pinned_root_mod_names: HashSet<String> = file_backed_mods
+        .iter()
+        .map(|m| m.ident.to_string())
+        .collect();
 
     // 3. Group into modules — replicates main.rs:336.
     let modules = analyzer.group_by_module(splitrs.max_lines);
@@ -103,6 +112,7 @@ fn perform_split_sync(
             cross_module_imports.get(&module.name),
             &fields_need_pub_super,
             Some(&analyzer.trait_tracker),
+            &pinned_root_mod_names,
         );
 
         let module_path = out_dir.join(format!("{}.rs", module.name));
@@ -154,11 +164,15 @@ fn perform_split_sync(
     // The LSP path does not currently support --extract-tests, so we pass
     // `false` here. CLI/binary callers go through `main.rs` and pass the
     // real flag.
-    let mod_rs_content = module_generator::generate_mod_rs(
+    let mod_rs_content = module_generator::generate_mod_rs_ext(
         &modules,
         &out_dir,
         test_module_path.as_deref(),
         false,
+        &[],
+        &[],
+        &file_backed_mods,
+        crate::config::FacadeStyle::Glob,
         &[],
     )
     .map_err(LspError::from)?;

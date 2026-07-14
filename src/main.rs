@@ -728,6 +728,26 @@ fn main() -> Result<()> {
         println!("Found {} trait implementations", total_trait_impls);
     }
 
+    // File-backed `mod x;` declarations (`check`, `fmt`, ...) from the
+    // original file. These must stay declared in the regenerated root
+    // `mod.rs` verbatim — see `FileAnalyzer::file_backed_mods` for why.
+    let file_backed_mods = analyzer.take_file_backed_mods();
+    let pinned_root_mod_names: std::collections::HashSet<String> = file_backed_mods
+        .iter()
+        .map(|m| m.ident.to_string())
+        .collect();
+    if !file_backed_mods.is_empty() {
+        println!(
+            "Keeping {} file-backed submodule declaration(s) in the root mod.rs: {}",
+            file_backed_mods.len(),
+            pinned_root_mod_names
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Feature C: plan the recursive split of every diverted inline module.
     // Planning is side-effect free so --dry-run can preview the full tree.
     let nested_mods = analyzer.take_nested_mods();
@@ -1027,6 +1047,7 @@ fn main() -> Result<()> {
             cross_module_imports.get(&module.name),
             &fields_need_pub_super,
             Some(&analyzer.trait_tracker),
+            &pinned_root_mod_names,
         );
         fs::write(&module_path, &content).context(format!(
             "Failed to write module file: {:?}\n\
@@ -1090,6 +1111,7 @@ fn main() -> Result<()> {
             tests_sibling_imports,
             args.deepen_super,
             &tests_parent_resolvable,
+            Some(&source_code),
         );
         let tests_path = output.join("tests.rs");
         fs::write(&tests_path, &tests_content).context(format!(
@@ -1114,8 +1136,11 @@ fn main() -> Result<()> {
     let lib_rs_path = output.join("lib.rs");
     if !lib_rs_path.exists() {
         let test_module_path = extract_test_module_path(&syntax_tree);
-        let child_decls: Vec<syn::ItemMod> =
-            nested_plans.iter().map(|plan| plan.decl_item()).collect();
+        let child_decls: Vec<syn::ItemMod> = nested_plans
+            .iter()
+            .map(|plan| plan.decl_item())
+            .chain(file_backed_mods.iter().cloned())
+            .collect();
         let mod_content = module_generator::generate_mod_rs_ext(
             &modules,
             output,

@@ -151,7 +151,19 @@ fn extract_cfg_attr_strings(mod_item: &syn::ItemMod) -> Vec<String> {
 ///     …
 /// }
 /// ```
-pub fn generate_per_test_file(block: &TestModBlock, file_uses: &[Item]) -> String {
+///
+/// `original_source`, when supplied, is the untouched source text of the file
+/// `block` was extracted from. The mod block is then emitted byte-verbatim
+/// (preserving inline `//`/`/* */` comments, which a `prettyplease` AST
+/// round-trip silently drops) instead of being re-printed from `block.item`.
+/// Pass `None` to keep the old round-tripped rendering (e.g. when `block` was
+/// built from `syn::parse_quote!` in a unit test, with no real file backing
+/// its spans).
+pub fn generate_per_test_file(
+    block: &TestModBlock,
+    file_uses: &[Item],
+    original_source: Option<&str>,
+) -> String {
     let mut content = String::new();
 
     // Copyright header
@@ -176,13 +188,26 @@ pub fn generate_per_test_file(block: &TestModBlock, file_uses: &[Item]) -> Strin
         content.push('\n');
     }
 
-    // The cfg-gated mod block verbatim (via AST round-trip).
-    let formatted_mod = prettyplease::unparse(&syn::File {
-        shebang: None,
-        attrs: Vec::new(),
-        items: vec![Item::Mod(block.item.clone())],
+    // Prefer a byte-verbatim slice of the cfg-gated mod block; fall back to
+    // the AST round-trip (which drops non-doc comments) when unavailable.
+    use syn::spanned::Spanned;
+    let verbatim = original_source.and_then(|src| {
+        let sm = crate::source_map::SourceMap::new(src);
+        sm.item_verbatim_with_indent(block.item.span(), &block.item.attrs)
     });
-    content.push_str(&formatted_mod);
+    match verbatim {
+        Some(verbatim_text) => {
+            content.push_str(verbatim_text);
+        }
+        None => {
+            let formatted_mod = prettyplease::unparse(&syn::File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: vec![Item::Mod(block.item.clone())],
+            });
+            content.push_str(&formatted_mod);
+        }
+    }
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -238,10 +263,21 @@ pub fn generate_split_mod_rs(
 /// Fallback: generate a single `tests.rs` (classic --extract-tests behaviour).
 ///
 /// Used when there is exactly one test module in the source file.
-pub fn generate_fallback_tests_rs(test_mod: &TestModBlock, file_uses: &[Item]) -> String {
-    crate::module_generator::generate_tests_rs_with_uses(
+///
+/// `original_source`, when supplied, enables byte-verbatim emission of the
+/// mod body (preserving inline comments); see [`generate_per_test_file`].
+pub fn generate_fallback_tests_rs(
+    test_mod: &TestModBlock,
+    file_uses: &[Item],
+    original_source: Option<&str>,
+) -> String {
+    crate::module_generator::generate_tests_rs_full(
         &[Item::Mod(test_mod.item.clone())],
         file_uses,
+        &std::collections::HashMap::new(),
+        false,
+        &HashSet::new(),
+        original_source,
     )
 }
 
@@ -284,8 +320,11 @@ pub fn run_split_test_modules(input_file: &Path, dry_run: bool) -> Result<bool> 
     if n == 1 {
         // Single-module fallback.
         println!("Only 1 test module found; using single tests.rs fallback.");
-        let tests_content =
-            generate_fallback_tests_rs(&analysis.test_modules[0], &analysis.use_items);
+        let tests_content = generate_fallback_tests_rs(
+            &analysis.test_modules[0],
+            &analysis.use_items,
+            Some(&source),
+        );
 
         // Production items go into mod.rs.
         let unique_names: Vec<String> = vec!["tests".to_string()];
@@ -361,7 +400,7 @@ pub fn run_split_test_modules(input_file: &Path, dry_run: bool) -> Result<bool> 
 
     // Write individual test files.
     for (block, unique_name) in analysis.test_modules.iter().zip(unique_names.iter()) {
-        let file_content = generate_per_test_file(block, &analysis.use_items);
+        let file_content = generate_per_test_file(block, &analysis.use_items, Some(&source));
         let file_path = output_dir.join(format!("{}.rs", unique_name));
         fs::write(&file_path, &file_content)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
@@ -492,7 +531,7 @@ mod tests {
 
         // Write per-module files.
         for (block, uname) in analysis.test_modules.iter().zip(unique.iter()) {
-            let content = generate_per_test_file(block, &analysis.use_items);
+            let content = generate_per_test_file(block, &analysis.use_items, Some(src));
             let path = tmp.join(format!("{}.rs", uname));
             fs::write(&path, &content).expect("write test file");
         }
@@ -561,7 +600,7 @@ mod tests {
         fs::create_dir_all(&tmp).expect("create tmp dir");
 
         let tests_content =
-            generate_fallback_tests_rs(&analysis.test_modules[0], &analysis.use_items);
+            generate_fallback_tests_rs(&analysis.test_modules[0], &analysis.use_items, Some(src));
         fs::write(tmp.join("tests.rs"), &tests_content).expect("write tests.rs");
 
         let unique_names = vec!["tests".to_string()];

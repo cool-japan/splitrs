@@ -112,6 +112,7 @@ impl Documented {
         None,
         &dummy_fields,
         None,
+        &dummy_needs_pub,
     );
 
     assert!(
@@ -159,6 +160,7 @@ pub fn increment(x: i32) -> i32 {
         None,
         &dummy_fields,
         None,
+        &dummy_needs_pub,
     );
 
     assert!(

@@ -345,6 +345,7 @@ fn per_rule_doc_becomes_module_header() {
         None,
         &HashMap::new(),
         None,
+        &HashSet::new(),
     );
     assert!(
         content.starts_with("//! Hashing (md5/sha) helpers"),

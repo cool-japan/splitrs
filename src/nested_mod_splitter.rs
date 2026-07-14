@@ -325,6 +325,17 @@ pub fn write_plan(
         }
     }
 
+    // File-backed `mod x;` declarations pinned to THIS level's root
+    // `mod.rs` (see `FileAnalyzer::file_backed_mods`) — forwarded original
+    // `use` statements referencing one of these by bare name need a
+    // `super::` prefix once relocated into a sibling generated file.
+    let pinned_root_mod_names: HashSet<String> = plan
+        .analyzer
+        .file_backed_mods
+        .iter()
+        .map(|m| m.ident.to_string())
+        .collect();
+
     for module in &plan.modules {
         let content = module.generate_content(
             &plan.synthetic_file,
@@ -334,6 +345,7 @@ pub fn write_plan(
             plan.cross_module_imports.get(&module.name),
             &plan.fields_need_pub_super,
             Some(&plan.analyzer.trait_tracker),
+            &pinned_root_mod_names,
         );
         let module_path = dir.join(format!("{}.rs", module.name));
         fs::write(&module_path, &content)
@@ -363,6 +375,12 @@ pub fn write_plan(
             tests_sibling_imports,
             true,
             &tests_parent_resolvable,
+            // TODO: `NestedModPlan` doesn't currently carry the original file's
+            // source text, so nested-mod-split test bodies still lose non-doc
+            // comments to the prettyplease round-trip. Thread it through if/when
+            // this path needs the same byte-verbatim treatment as the top-level
+            // `--extract-tests` output in `main.rs`.
+            None,
         );
         let tests_path = dir.join("tests.rs");
         fs::write(&tests_path, &tests_content)
@@ -381,6 +399,7 @@ pub fn write_plan(
         created.extend(write_plan(child, &dir, facade)?);
         child_decls.push(child.decl_item());
     }
+    child_decls.extend(plan.analyzer.file_backed_mods.iter().cloned());
 
     let test_module_path = extract_test_module_path(&plan.synthetic_file);
     let mod_content = generate_mod_rs_ext(
