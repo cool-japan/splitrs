@@ -645,7 +645,7 @@ Tested on real-world codebases:
 
 ## 🧪 Testing
 
-SplitRS includes **450 comprehensive tests** covering all analysis components:
+SplitRS includes **608 comprehensive tests** (537 with default features, 1 skipped) covering all analysis components:
 
 ```bash
 # Run all tests (recommended)
@@ -762,7 +762,17 @@ cargo build
 cargo test
 ```
 
-### Implemented Features (v0.3.4 — Latest Release)
+### Implemented Features (v0.3.5 — Latest Release)
+
+**v0.3.5 Highlights (2026-07-14):**
+- ✅ File-backed `mod x;` declarations (`content: None`) are no longer bucketed into a generated file — kept pinned to the regenerated root `mod.rs` verbatim, with forwarded references rewritten to `super::x::...`; fixes `E0583`/`E0432` when splitting a file with a real `mod check;`/`mod fmt;`
+- ✅ Cross-chunk method calls under `--split-impl-blocks` now correctly resolve: methods defined only inside a `method_group` chunk are recognized as definition sites, fixing `E0624`, while a narrower free-function-only map still prevents invalid `use super::<mod>::<method>;` imports (E0432)
+- ✅ Cross-module `const`/`static` references fixed: helper calls inside a `static`/`const` initializer now trigger visibility upgrades correctly, and extracted `tests.rs` now imports sibling-module constants it references by name (previously only caught by `cargo test`, not `cargo check`)
+- ✅ `bitflags::bitflags! { ... }` invocations now register their defined type names for cross-module imports and public facade re-exports (fixes `E0425`/`E0433`)
+- ✅ `Type::from_str(...)` associated calls and `write!`/`writeln!` macros now correctly keep their required trait imports alive during pruning (fixes `E0599`)
+- ✅ `use a::b::{self, *}` pruning no longer keeps a spurious `self` binding alongside an unrelated kept glob, eliminating false `unused_imports` warnings
+- ✅ Byte-verbatim comment preservation extended to extracted test modules and visibility-upgraded impl/standalone items (previously any item needing `pub(super)` lost its comments to a prettyplease fallback)
+- ✅ Test suite: 608 tests passing with `--all-features` (537 with default features, 1 skipped), was 570 in v0.3.4
 
 **v0.3.4 Highlights (2026-07-06):**
 - ✅ Nested-mod descent correctness review: relocated private inline `mod` items are widened to `pub(super)` (new `Item::Mod` arm in `upgrade_type_visibility`), fixing `E0603` against the `use self::<bucket>::<mod>;` re-binding in generated `mod.rs`

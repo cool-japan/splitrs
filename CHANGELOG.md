@@ -5,7 +5,24 @@ All notable changes to SplitRS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.5] - Unreleased
+## [0.3.5] - 2026-07-14
+
+### Fixed
+- **File-backed submodule declarations** (`pub mod x;` with no inline body) are no longer relocated into a generated bucket file — new `FileAnalyzer::file_backed_mods` keeps them declared verbatim in the regenerated root `mod.rs`, and `rewrite_pinned_mod_refs_in_use` rewrites forwarded `use` statements that reference them with a `super::` prefix; fixes `E0583` (wrong sibling-file lookup) and `E0432` (broken absolute-path references) when splitting a file containing a real `mod check;`/`mod fmt;`-style declaration
+- **Cross-chunk method calls under `--split-impl-blocks`**: methods defined only inside a `method_group` chunk are now recognized as definition sites (`FileAnalyzer::module_defined_callables`), fixing `E0624: method ... is private` (and a false `unconditional_recursion` in some cases) when one impl-block chunk calls a private method living in a sibling chunk — while a new `free_fn_to_module` map ensures such methods are still never emitted as an (invalid) `use super::<mod>::<method>;` import
+- **Cross-module `const`/`static` references**: a `static`/`const` initializer that calls a helper (`static TABLE: [u8; 256] = build_table();`) now correctly triggers the callee's visibility upgrade/import; extracted `tests.rs` referencing a sibling module's `const`/`static` by name now receives the `use super::<module>::<NAME>;` import it needs (previously invisible to `cargo check`, only surfacing as `E0425` under `cargo test`/`nextest`)
+- **`bitflags::bitflags! { ... }` invocations** now register the type name(s) they define (`bitflags_defined_idents`/`bitflags_defines_pub_type`, scanning the raw macro token stream), fixing `E0425`/`E0433` on cross-module references to a bitflags-defined type and ensuring such types are re-exported through the module's public facade
+- **`Type::from_str(...)` associated calls and `write!`/`writeln!` macros** now keep their required trait import (`std::str::FromStr`, `std::fmt::Write`/`std::io::Write`) alive during import pruning, fixing `E0599` from a forwarded import being incorrectly pruned as unused
+- **`use a::b::{self, *}` pruning**: the `self` leaf now correctly tracks the *enclosing* path segment's usage instead of always surviving alongside any kept sibling leaf, eliminating spurious `unused_imports` warnings in generated modules
+- **Grouped-import detection** (`already_imported`) rewritten from a string-based, first-`{...}`-only scan to AST-based `collect_use_bound_names`, fixing `E0252: the name ... is defined multiple times` on multi-segment nested grouped imports (e.g. `std::{borrow::Cow, collections::{HashMap, VecDeque}}`)
+- **Byte-verbatim comment preservation** extended to extracted test modules and impl-block/standalone items that need a `pub(super)` visibility upgrade: `generate_tests_rs_full`, `test_module_splitter::generate_per_test_file`/`generate_fallback_tests_rs` now accept the original source and slice test `mod` bodies byte-verbatim (preserving inline `//`/`/* */` comments the AST round-trip drops); new `upgrade_verbatim_item_visibility` text-patches the `pub(super) ` prefix onto a verbatim-sliced private item without discarding its comments, correctly skipping leading attributes and line/block comments
+
+### Changed
+- `module_generator::generate_mod_rs` is no longer called from the bin (which now always calls `generate_mod_rs_ext` directly so file-backed mods can be passed through as pinned `child_mods`); marked `#[allow(dead_code)]` since it's now exercised only by the library's own test suite and external consumers
+- `Module::generate_content` gained a `pinned_root_mods: &HashSet<String>` parameter (all callers updated, including test helpers)
+- `generate_tests_rs_full` / `generate_tests_rs_with_imports_deep` gained an `original_source: Option<&str>` parameter
+- `test_module_splitter::generate_fallback_tests_rs` now delegates to `generate_tests_rs_full` instead of `generate_tests_rs_with_uses`
+- Tests: `tests/cross_module_visibility_tests.rs` extended with regression coverage reproducing real failures found while splitting the oxisqlite-core/oxisql `sqlite3-parser` crates (cross-chunk method visibility, sibling-const imports, file-backed mod pinning, bitflags exports, `from_str` imports, `self`-leaf-in-group pruning)
 
 ## [0.3.4] - 2026-07-06
 

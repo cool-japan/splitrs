@@ -603,6 +603,18 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 - ✅ Review fixes for `--split-nested-mods` correctness: `Item::Mod` visibility widening (E0603), parent-provided `use super::*;` glob retention + private-trait method bindings (E0425/E0599), `macro_rules!` names excluded from importable exports (E0432/E0659), parent-import pruning against the nested body's own use trees (unused_imports)
 - ✅ Test suite: 570 tests passing with `--all-features` (5 new regression tests, one per review finding)
 
+### v0.3.5 (Released 2026-07-14)
+- ✅ File-backed `mod x;` declarations (`content: None`) pinned to the regenerated root `mod.rs` instead of being bucketed (`FileAnalyzer::file_backed_mods`, `rewrite_pinned_mod_refs_in_use`); fixes `E0583`/`E0432`
+- ✅ Cross-chunk method-call visibility under `--split-impl-blocks` (`FileAnalyzer::module_defined_callables`, `free_fn_to_module`): methods in sibling `method_group` chunks are now valid definition sites without becoming invalid `use` imports; fixes `E0624`
+- ✅ Cross-module `const`/`static` reference fixes: helper calls in initializers now tracked; extracted `tests.rs` imports sibling constants referenced by name (fixes `E0425` under `cargo test`)
+- ✅ `bitflags::bitflags! { ... }` invocation type names registered for cross-module imports and facade re-exports (`bitflags_defined_idents`, `bitflags_defines_pub_type`)
+- ✅ `Type::from_str(...)` and `write!`/`writeln!` now keep required trait imports alive during pruning (fixes `E0599`)
+- ✅ `use a::b::{self, *}` pruning now tracks the enclosing path segment's usage instead of always keeping `self` alongside any surviving sibling leaf
+- ✅ Grouped-import "already imported" detection rewritten from string-scanning to AST-based `collect_use_bound_names` (fixes `E0252` on nested multi-segment groups)
+- ✅ Byte-verbatim comment preservation extended to extracted test modules (`generate_tests_rs_full`, `test_module_splitter`) and visibility-upgraded verbatim items (`upgrade_verbatim_item_visibility`)
+- ✅ Codebase: 30,067 lines across 70 Rust files
+- ✅ Test suite: 608 tests passing with `--all-features` (537 with default features, 1 skipped), was 570 in v0.3.4
+
 ### v1.0.0 (Production Ready)
 - All critical features implemented
 - Comprehensive documentation
@@ -612,5 +624,5 @@ Want to implement any of these features? See [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 ---
 
-**Last Updated:** 2026-07-06
+**Last Updated:** 2026-07-14
 **Maintainers:** COOLJAPAN OU (Team KitaSan)
