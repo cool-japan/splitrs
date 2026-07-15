@@ -170,44 +170,28 @@ pub fn generate_per_test_file(
     content.push_str("// Copyright 2026 COOLJAPAN OU (Team KitaSan)\n");
     content.push_str("// SPDX-License-Identifier: Apache-2.0\n\n");
 
-    // Forward the parent file's use statements so that `use super::*` can
-    // resolve external types that were previously in file scope.
-    let use_items: Vec<Item> = file_uses
-        .iter()
-        .filter(|it| matches!(it, Item::Use(_)))
-        .cloned()
-        .collect();
-
-    if !use_items.is_empty() {
-        let formatted = prettyplease::unparse(&syn::File {
-            shebang: None,
-            attrs: Vec::new(),
-            items: use_items,
-        });
-        content.push_str(&formatted);
-        content.push('\n');
-    }
-
-    // Prefer a byte-verbatim slice of the cfg-gated mod block; fall back to
-    // the AST round-trip (which drops non-doc comments) when unavailable.
-    use syn::spanned::Spanned;
-    let verbatim = original_source.and_then(|src| {
-        let sm = crate::source_map::SourceMap::new(src);
-        sm.item_verbatim_with_indent(block.item.span(), &block.item.attrs)
-    });
-    match verbatim {
-        Some(verbatim_text) => {
-            content.push_str(verbatim_text);
-        }
-        None => {
-            let formatted_mod = prettyplease::unparse(&syn::File {
-                shebang: None,
-                attrs: Vec::new(),
-                items: vec![Item::Mod(block.item.clone())],
-            });
-            content.push_str(&formatted_mod);
-        }
-    }
+    // Delegate to the shared consolidated-tests generator so a per-module file
+    // gets exactly the same treatment as the single-module fallback:
+    //
+    //   * unused forwarded `use`s are pruned (no `unused_imports` warnings);
+    //   * a file-level `use super::*;` is emitted so the extracted `mod` — which
+    //     now lands ONE level deeper than it was in the original file
+    //     (`parent::<file>::<mod>` instead of `parent::<mod>`) — can still
+    //     resolve the parent module's production items. Without it the moved
+    //     test module fails `cargo nextest run --no-run` with E0422/E0425 while
+    //     `cargo build` (which never compiles `#[cfg(test)]` code) stays green;
+    //   * the `mod` body is sliced byte-verbatim from `original_source`,
+    //     preserving inline `//`/`/* */` comments an AST round-trip drops.
+    let items = [Item::Mod(block.item.clone())];
+    let body = crate::module_generator::generate_tests_rs_full(
+        &items,
+        file_uses,
+        &std::collections::HashMap::new(),
+        false,
+        &HashSet::new(),
+        original_source,
+    );
+    content.push_str(&body);
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -224,7 +208,24 @@ pub fn generate_per_test_file(
 pub fn generate_split_mod_rs(
     analysis: &SplitTestAnalysis,
     unique_names: &[String],
+    original_source: Option<&str>,
 ) -> Result<String> {
+    // Preferred path: rebuild `mod.rs` byte-verbatim from the ORIGINAL source,
+    // cutting out only the test-module blocks (each replaced in place by its
+    // cfg-gated `mod <unique_name>;` declaration). This preserves EVERY
+    // production comment — including free-standing `//`/`/* */` blocks between
+    // items that belong to no AST node and that a `prettyplease` round-trip of
+    // `production_items` silently destroys (the ~90-line "design rationale"
+    // class of loss).
+    if let Some(src) = original_source {
+        if let Some(rendered) = render_split_mod_rs_verbatim(analysis, unique_names, src) {
+            return Ok(rendered);
+        }
+    }
+
+    // Fallback (no source available, or a span failed to map): AST round-trip.
+    // Non-doc comments are lost here, but this path only runs for
+    // `syn::parse_quote!`-built inputs in unit tests, never for a real file.
     let mut content = String::new();
 
     // Header
@@ -258,6 +259,57 @@ pub fn generate_split_mod_rs(
     }
 
     Ok(content)
+}
+
+/// Rebuild `mod.rs` from the original source, replacing each test-module block
+/// (its leading attributes + `mod NAME { … }`, through the end of the closing
+/// brace's physical line) in place with `<cfg attrs>\nmod <unique_name>;`.
+///
+/// Returns `None` if any block's span fails to map to a byte range, or the cut
+/// ranges come out overlapping/out-of-order — the caller then falls back to the
+/// AST round-trip.
+fn render_split_mod_rs_verbatim(
+    analysis: &SplitTestAnalysis,
+    unique_names: &[String],
+    src: &str,
+) -> Option<String> {
+    use syn::spanned::Spanned;
+    let sm = crate::source_map::SourceMap::new(src);
+
+    // (start, end, replacement) for each test block, in source order.
+    let mut cuts: Vec<(usize, usize, String)> = Vec::with_capacity(analysis.test_modules.len());
+    for (block, unique_name) in analysis.test_modules.iter().zip(unique_names.iter()) {
+        let (start, end) = sm.item_cut_range(block.item.span(), &block.item.attrs)?;
+        let indent = sm
+            .line_leading_indent(block.item.span(), &block.item.attrs)
+            .unwrap_or("");
+        let mut repl = String::new();
+        for cfg_line in &block.cfg_attrs {
+            repl.push_str(indent);
+            repl.push_str(cfg_line);
+            repl.push('\n');
+        }
+        repl.push_str(indent);
+        repl.push_str(&format!("mod {};\n", unique_name));
+        cuts.push((start, end, repl));
+    }
+
+    // Splice: original text between cuts kept verbatim; each cut → replacement.
+    let mut out = String::new();
+    let mut pos = 0usize;
+    for (start, end, repl) in &cuts {
+        if *start < pos {
+            return None; // overlapping / out of order → bail to fallback
+        }
+        out.push_str(src.get(pos..*start)?);
+        out.push_str(repl);
+        pos = *end;
+    }
+    out.push_str(src.get(pos..)?);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Fallback: generate a single `tests.rs` (classic --extract-tests behaviour).
@@ -340,7 +392,7 @@ pub fn run_split_test_modules(input_file: &Path, dry_run: bool) -> Result<bool> 
             production_items: analysis.production_items.clone(),
             use_items: analysis.use_items.clone(),
         };
-        let mod_content = generate_split_mod_rs(&fallback_analysis, &unique_names)?;
+        let mod_content = generate_split_mod_rs(&fallback_analysis, &unique_names, Some(&source))?;
 
         if dry_run {
             println!(
@@ -351,6 +403,10 @@ pub fn run_split_test_modules(input_file: &Path, dry_run: bool) -> Result<bool> 
             println!("  tests.rs ({} lines)", tests_content.lines().count());
             return Ok(false);
         }
+
+        // Safety net: warn if any inline comment was silently dropped.
+        let combined = format!("{tests_content}\n{mod_content}");
+        crate::source_map::warn_if_comments_dropped(&source, &combined);
 
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("Cannot create output dir: {}", output_dir.display()))?;
@@ -398,17 +454,32 @@ pub fn run_split_test_modules(input_file: &Path, dry_run: bool) -> Result<bool> 
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("Cannot create output dir: {}", output_dir.display()))?;
 
-    // Write individual test files.
+    // Generate every per-module file and mod.rs up front so we can audit comment
+    // survival across the whole output before writing anything to disk.
+    let mut generated: Vec<(PathBuf, String)> = Vec::new();
     for (block, unique_name) in analysis.test_modules.iter().zip(unique_names.iter()) {
         let file_content = generate_per_test_file(block, &analysis.use_items, Some(&source));
         let file_path = output_dir.join(format!("{}.rs", unique_name));
-        fs::write(&file_path, &file_content)
+        generated.push((file_path, file_content));
+    }
+    let mod_content = generate_split_mod_rs(&analysis, &unique_names, Some(&source))?;
+
+    // Safety net: warn if any inline comment was silently dropped.
+    let mut combined = mod_content.clone();
+    for (_, content) in &generated {
+        combined.push('\n');
+        combined.push_str(content);
+    }
+    crate::source_map::warn_if_comments_dropped(&source, &combined);
+
+    // Write individual test files.
+    for (file_path, file_content) in &generated {
+        fs::write(file_path, file_content)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
         println!("Created: {}", file_path.display());
     }
 
     // Write mod.rs.
-    let mod_content = generate_split_mod_rs(&analysis, &unique_names)?;
     let mod_path = output_dir.join("mod.rs");
     fs::write(&mod_path, &mod_content).with_context(|| "Failed to write mod.rs")?;
     println!("Created: {}", mod_path.display());
@@ -536,7 +607,8 @@ mod tests {
             fs::write(&path, &content).expect("write test file");
         }
         // Write mod.rs.
-        let mod_content = generate_split_mod_rs(&analysis, &unique).expect("generate mod.rs");
+        let mod_content =
+            generate_split_mod_rs(&analysis, &unique, Some(src)).expect("generate mod.rs");
         fs::write(tmp.join("mod.rs"), &mod_content).expect("write mod.rs");
 
         // Verify: two sub-files were created.
@@ -614,8 +686,8 @@ mod tests {
             production_items: analysis.production_items.clone(),
             use_items: analysis.use_items.clone(),
         };
-        let mod_content =
-            generate_split_mod_rs(&fallback_analysis, &unique_names).expect("generate mod.rs");
+        let mod_content = generate_split_mod_rs(&fallback_analysis, &unique_names, Some(src))
+            .expect("generate mod.rs");
         fs::write(tmp.join("mod.rs"), &mod_content).expect("write mod.rs");
 
         // Verify: single tests.rs (not tests_only.rs).
@@ -634,5 +706,110 @@ mod tests {
         );
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ── Bug #1 regression: mod.rs must retain production comments ──────────────
+
+    #[test]
+    fn split_mod_rs_preserves_production_comments() {
+        // Regression: `generate_split_mod_rs` used to run every production item
+        // through `prettyplease`, silently dropping ALL non-doc comments —
+        // including free-standing rationale blocks between items.
+        let src = r#"
+// Free-standing design rationale block.
+// Second line of rationale — MUST survive the split.
+use std::fmt;
+
+/// A widget.
+pub struct Widget {
+    // field note: kept private on purpose
+    count: u32,
+}
+
+impl fmt::Display for Widget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // formatting rationale lives here
+        write!(f, "{}", self.count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn t() {
+        let _ = Widget { count: 0 };
+    }
+}
+"#;
+        let analysis = analyse_str(src);
+        let unique = make_unique_names(&analysis.test_modules);
+        let mod_rs = generate_split_mod_rs(&analysis, &unique, Some(src)).expect("mod.rs");
+
+        assert!(
+            mod_rs.contains("// Free-standing design rationale block."),
+            "free-standing comment lost:\n{mod_rs}"
+        );
+        assert!(
+            mod_rs.contains("// Second line of rationale — MUST survive the split."),
+            "second rationale line lost:\n{mod_rs}"
+        );
+        assert!(
+            mod_rs.contains("// field note: kept private on purpose"),
+            "inline field comment lost:\n{mod_rs}"
+        );
+        assert!(
+            mod_rs.contains("// formatting rationale lives here"),
+            "inline method comment lost:\n{mod_rs}"
+        );
+        // The test body must have been relocated out of mod.rs …
+        assert!(
+            !mod_rs.contains("fn t()"),
+            "test body must not remain in mod.rs:\n{mod_rs}"
+        );
+        // … and replaced by a cfg-gated `mod tests;` declaration.
+        assert!(
+            mod_rs.contains("mod tests;"),
+            "mod declaration missing:\n{mod_rs}"
+        );
+    }
+
+    // ── Bug #2 regression: per-module file must re-export the parent scope ─────
+
+    #[test]
+    fn per_test_file_emits_super_glob_for_parent_items() {
+        // Regression: the multi-module path emitted the extracted test `mod`
+        // one level deeper without a file-level `use super::*;`, so the moved
+        // test could not see the parent module's production items and failed
+        // `cargo nextest run --no-run` (E0422/E0425) while `cargo build` stayed
+        // green (it skips `#[cfg(test)]`).
+        let src = r#"
+pub fn helper() -> u32 { 7 }
+
+#[cfg(all(test, feature = "x"))]
+mod tests_a {
+    use super::*;
+    // references parent production fn `helper`
+    #[test]
+    fn t() {
+        assert_eq!(helper(), 7);
+    }
+}
+"#;
+        let analysis = analyse_str(src);
+        let block = &analysis.test_modules[0];
+        let file = generate_per_test_file(block, &analysis.use_items, Some(src));
+
+        let mod_pos = file.find("mod tests_a").expect("mod present in output");
+        let before_mod = &file[..mod_pos];
+        assert!(
+            before_mod.contains("use super::*;"),
+            "file-level `use super::*;` (parent re-export) missing before the test mod:\n{file}"
+        );
+        // Inline comment inside the test body survives (verbatim slice).
+        assert!(
+            file.contains("// references parent production fn `helper`"),
+            "inline comment lost:\n{file}"
+        );
     }
 }

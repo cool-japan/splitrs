@@ -8,13 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - Unreleased
 
 ### Added
-- Nothing yet.
+- **Comment-loss safety net** (`src/source_map.rs`): a string-state-aware comment
+  scanner (`extract_comment_texts` / `dropped_comment_texts` / `warn_if_comments_dropped`)
+  that skips `//`/`/* */` sequences inside string/char/raw-string literals and
+  does not mistake a `'a` lifetime for a char literal. SplitRS relocates code
+  rather than deleting it, so any source comment absent from the combined output
+  is lost design rationale — the CLI now emits a non-fatal `warning: SplitRS
+  dropped N inline comment(s)` (with a preview) on both `--split-test-modules`
+  and the default `--input`/`--output` path instead of destroying it silently.
+- `SourceMap::item_cut_range` / `SourceMap::line_leading_indent`: byte-range and
+  indentation helpers used to cut a `#[cfg(test)] mod` block out of the original
+  source verbatim while leaving surrounding production text byte-for-byte intact.
 
 ### Changed
-- Nothing yet.
+- `test_module_splitter::generate_split_mod_rs` gained an `original_source:
+  Option<&str>` parameter (all callers updated).
+- `test_module_splitter::generate_per_test_file` now delegates to
+  `module_generator::generate_tests_rs_full` so the multi-module path shares the
+  single-module path's import handling (pruned forwards + a file-level
+  `use super::*;`) and its byte-verbatim `mod`-body slicing.
 
 ### Fixed
-- Nothing yet.
+- **Silent inline-comment loss under `--split-test-modules`**: the generated
+  `mod.rs` used to run every production item through `prettyplease`, which drops
+  ALL non-doc `//`/`/* */` comments — including free-standing rationale blocks
+  between items that belong to no AST node (a ~90-line design-rationale block
+  vanished on a real 1900-line split). `generate_split_mod_rs` now rebuilds
+  `mod.rs` byte-verbatim from the original source, cutting out only the
+  test-module blocks (each replaced in place by its cfg-gated `mod NAME;`
+  declaration), so every production comment survives. The AST round-trip remains
+  only as a fallback for `syn::parse_quote!`-built inputs in unit tests.
+- **`--split-test-modules` build-passes / `nextest`-fails split**: the
+  multi-module path emitted each extracted `#[cfg(test)] mod` one level deeper
+  (`parent::<file>::<mod>`) without a file-level `use super::*;`, so the moved
+  test could not resolve the parent module's production items. `cargo build`
+  skips `#[cfg(test)]` and stayed green while `cargo nextest run --no-run` /
+  `cargo test --no-run` failed with `E0422`/`E0425`. `generate_per_test_file`
+  now emits the parent re-export (and prunes unused forwarded `use`s), so the
+  emitted tree compiles as a test target.
+- Regression coverage: `tests/split_test_modules_preservation.rs` (runs the real
+  CLI, asserts comment survival, and compiles the output with `rustc --test
+  --emit=metadata` to catch the import regression) plus unit tests in
+  `source_map.rs` and `test_module_splitter.rs`.
+
+### Known limitations
+- The default `--input`/`--output` splitter still regenerates **type
+  definitions** (structs/enums and their impl blocks) and the file's leading
+  free-standing header via `prettyplease`, so their non-doc comments are not yet
+  preserved. This is now *reported* by the comment-loss safety net (a warning
+  lists the dropped comments) rather than happening silently; full verbatim
+  emission for type items is tracked as follow-up work.
 
 ## [0.3.5] - 2026-07-14
 

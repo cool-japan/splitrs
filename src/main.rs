@@ -1027,6 +1027,12 @@ fn main() -> Result<()> {
     let mut created_count = 0;
     let mut skipped_count = 0;
 
+    // Accumulate every generated file's text so that — after all writes — we can
+    // audit whether any inline comment was silently dropped. SplitRS relocates
+    // code rather than deleting it, so a dropped non-doc `//`/`/* */` comment is
+    // always lost design rationale. Purely diagnostic: never alters/blocks output.
+    let mut audit_output = String::new();
+
     // Write module files
     for module in &modules {
         // In incremental mode, check if we should skip this module
@@ -1049,6 +1055,8 @@ fn main() -> Result<()> {
             Some(&analyzer.trait_tracker),
             &pinned_root_mod_names,
         );
+        audit_output.push_str(&content);
+        audit_output.push('\n');
         fs::write(&module_path, &content).context(format!(
             "Failed to write module file: {:?}\n\
              Please ensure:\n\
@@ -1078,6 +1086,10 @@ fn main() -> Result<()> {
     for plan in &nested_plans {
         let files = nested_mod_splitter::write_plan(plan, output, facade)?;
         for file in &files {
+            if let Ok(text) = fs::read_to_string(file) {
+                audit_output.push_str(&text);
+                audit_output.push('\n');
+            }
             println!("Created: {:?}", file);
         }
         created_count += files.len();
@@ -1113,6 +1125,8 @@ fn main() -> Result<()> {
             &tests_parent_resolvable,
             Some(&source_code),
         );
+        audit_output.push_str(&tests_content);
+        audit_output.push('\n');
         let tests_path = output.join("tests.rs");
         fs::write(&tests_path, &tests_content).context(format!(
             "Failed to write tests.rs file: {:?}\n\
@@ -1152,6 +1166,8 @@ fn main() -> Result<()> {
             facade,
             &scope_uses,
         )?;
+        audit_output.push_str(&mod_content);
+        audit_output.push('\n');
         let mod_path = output.join("mod.rs");
         fs::write(&mod_path, &mod_content).context(format!(
             "Failed to write mod.rs file: {:?}\n\
@@ -1179,6 +1195,14 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    // Comment-loss safety net: warn (never fail) if regenerating the modules
+    // dropped any non-doc comment. Skipped in incremental mode, where unchanged
+    // modules are intentionally not regenerated (their comments live in files we
+    // didn't rewrite, so an audit would false-positive).
+    if incremental_result.is_none() {
+        source_map::warn_if_comments_dropped(&source_code, &audit_output);
     }
 
     // Remove the original input file when splitting a leaf sub-module *in place*
