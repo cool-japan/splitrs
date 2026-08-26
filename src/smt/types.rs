@@ -96,7 +96,8 @@ pub fn zero_extend(tm: &mut TermManager, term: TermId, from_w: u32, to_w: u32) -
     let pad_bits = to_w - from_w;
     let zero = tm.mk_bitvec(0i64, pad_bits);
     // concat(high, low): the zero pad becomes the most-significant bits.
-    tm.mk_bv_concat(zero, term)
+    tm.try_mk_bv_concat(zero, term)
+        .expect("zero-padding literal and term are both bit-vector sorted")
 }
 
 /// Sign-extend `term` from `from_w` bits to `to_w` bits by replicating the
@@ -111,9 +112,12 @@ pub fn sign_extend(tm: &mut TermManager, term: TermId, from_w: u32, to_w: u32) -
     // Replicate it `pad_bits` times via repeated concat, then prepend.
     let mut replicated = sign_bit;
     for _ in 1..pad_bits {
-        replicated = tm.mk_bv_concat(replicated, sign_bit);
+        replicated = tm
+            .try_mk_bv_concat(replicated, sign_bit)
+            .expect("replicated sign bit and sign bit are both bit-vector sorted");
     }
-    tm.mk_bv_concat(replicated, term)
+    tm.try_mk_bv_concat(replicated, term)
+        .expect("replicated sign bits and term are both bit-vector sorted")
 }
 
 #[cfg(test)]
