@@ -413,9 +413,9 @@ impl<'tm> Encoder<'tm> {
         if target.width > source.width {
             // Widening: zero-extend unsigned source, sign-extend signed source.
             let term = if source.signed {
-                sign_extend(self.tm, inner.term, source.width, target.width)
+                sign_extend(self.tm, inner.term, source.width, target.width)?
             } else {
-                zero_extend(self.tm, inner.term, source.width, target.width)
+                zero_extend(self.tm, inner.term, source.width, target.width)?
             };
             Ok(Encoded {
                 term,

@@ -87,24 +87,52 @@ pub fn decode_bits(raw: &BigInt, ty: IntType) -> String {
     unsigned.to_string()
 }
 
+/// Describe a failed bit-vector concatenation while building an extension.
+///
+/// `stage` names the extension step that was running, so the message the
+/// encoder surfaces to the caller points at the construct that failed.
+fn concat_failure(stage: &str, err: &impl std::fmt::Display) -> String {
+    format!("bit-vector concat failed while {stage}: {err}")
+}
+
 /// Zero-extend `term` from `from_w` bits to `to_w` bits by prepending a zero
 /// block. `to_w` must be strictly greater than `from_w`.
-pub fn zero_extend(tm: &mut TermManager, term: TermId, from_w: u32, to_w: u32) -> TermId {
+///
+/// # Errors
+///
+/// Returns a description of the failure when `term` is not bit-vector sorted
+/// (the solver's concat builder refuses to splice a non-bit-vector operand).
+pub fn zero_extend(
+    tm: &mut TermManager,
+    term: TermId,
+    from_w: u32,
+    to_w: u32,
+) -> Result<TermId, String> {
     if to_w <= from_w {
-        return term;
+        return Ok(term);
     }
     let pad_bits = to_w - from_w;
     let zero = tm.mk_bitvec(0i64, pad_bits);
     // concat(high, low): the zero pad becomes the most-significant bits.
     tm.try_mk_bv_concat(zero, term)
-        .expect("zero-padding literal and term are both bit-vector sorted")
+        .map_err(|err| concat_failure("zero-padding the operand", &err))
 }
 
 /// Sign-extend `term` from `from_w` bits to `to_w` bits by replicating the
 /// sign bit. `to_w` must be strictly greater than `from_w`.
-pub fn sign_extend(tm: &mut TermManager, term: TermId, from_w: u32, to_w: u32) -> TermId {
+///
+/// # Errors
+///
+/// Returns a description of the failure when `term` is not bit-vector sorted
+/// (the solver's concat builder refuses to splice a non-bit-vector operand).
+pub fn sign_extend(
+    tm: &mut TermManager,
+    term: TermId,
+    from_w: u32,
+    to_w: u32,
+) -> Result<TermId, String> {
     if to_w <= from_w {
-        return term;
+        return Ok(term);
     }
     let pad_bits = to_w - from_w;
     // Extract the sign bit (the most-significant bit of the source).
@@ -114,10 +142,10 @@ pub fn sign_extend(tm: &mut TermManager, term: TermId, from_w: u32, to_w: u32) -
     for _ in 1..pad_bits {
         replicated = tm
             .try_mk_bv_concat(replicated, sign_bit)
-            .expect("replicated sign bit and sign bit are both bit-vector sorted");
+            .map_err(|err| concat_failure("replicating the sign bit", &err))?;
     }
     tm.try_mk_bv_concat(replicated, term)
-        .expect("replicated sign bits and term are both bit-vector sorted")
+        .map_err(|err| concat_failure("prepending the sign bits", &err))
 }
 
 #[cfg(test)]
@@ -241,5 +269,36 @@ mod tests {
         // 0x80000000 -> -2147483648
         let min = BigInt::from(1u8) << 31;
         assert_eq!(decode_bits(&min, i32t), "-2147483648");
+    }
+
+    #[test]
+    fn zero_extend_widens_a_bit_vector_term() {
+        let mut tm = TermManager::new();
+        let term = tm.mk_bitvec(5i64, 8);
+        let widened = zero_extend(&mut tm, term, 8, 32);
+        assert!(widened.is_ok());
+        // A non-widening request hands the term back untouched.
+        assert_eq!(zero_extend(&mut tm, term, 8, 8), Ok(term));
+    }
+
+    #[test]
+    fn sign_extend_widens_a_bit_vector_term() {
+        let mut tm = TermManager::new();
+        let term = tm.mk_bitvec(5i64, 8);
+        let widened = sign_extend(&mut tm, term, 8, 32);
+        assert!(widened.is_ok());
+        assert_eq!(sign_extend(&mut tm, term, 8, 8), Ok(term));
+    }
+
+    #[test]
+    fn extending_a_non_bit_vector_term_is_an_error_not_a_panic() {
+        let mut tm = TermManager::new();
+        let flag = tm.mk_true();
+        let zero = zero_extend(&mut tm, flag, 1, 8);
+        assert!(matches!(&zero, Err(msg) if msg.contains("bit-vector concat failed")));
+        // The sign bit of a Boolean cannot be extracted either way; whichever
+        // step the solver rejects, the failure is reported through `Err`.
+        let signed = sign_extend(&mut tm, flag, 1, 8);
+        assert!(matches!(&signed, Err(msg) if msg.contains("bit-vector concat failed")));
     }
 }
