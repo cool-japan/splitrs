@@ -872,7 +872,7 @@ Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www
 
 ## Sponsorship
 
-SplitRS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+SplitRS is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find SplitRS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
 
